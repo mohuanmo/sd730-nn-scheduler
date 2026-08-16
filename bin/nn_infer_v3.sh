@@ -5,8 +5,9 @@
 # 输入:
 #   .coll_state           聚合状态 6 字段 (pkg|jiffies|ts|threads|mem|cpu)
 #   .threads_snapshot     线程快照 (每行: name|cpu%|21维线程特征), 由 collector 采样
-#   model/mlp_v3_enc.txt  场景编码器权重 (24->10: W1,b1,Wk,bk,Ws,bs)
+#   model/mlp_v3_enc.txt  场景编码器权重 (33->10: W1,b1,Wk,bk,Ws,bs) (v3.3)
 #   model/mlp_v3_scr.txt  线程打分器权重 (31->8->1: W1,b1,W2,b2)
+#   (兼容旧 25 维模型: 动态识别 W1 行数)
 #
 # 输出:
 #   每线程: name|cpu_pct|score|hot
@@ -82,6 +83,14 @@ FG_DUR=0
 [ -f "$FG_DUR_FILE" ] && FG_DUR=$(cat "$FG_DUR_FILE" 2>/dev/null)
 case "$FG_DUR" in ''|*[!0-9]*) FG_DUR=0 ;; esac
 
+# v3.3: 每核使用率 (.core_load = c0|c1|...|c7, 采集端每 5s 更新)
+CORE_STR="0|0|0|0|0|0|0|0"
+CORE_LOAD_F="$MODDIR/data/collector/.core_load"
+if [ -f "$CORE_LOAD_F" ]; then
+    CORE_STR=$(cat "$CORE_LOAD_F" 2>/dev/null)
+    case "$CORE_STR" in ''|*[!0-9|]*) CORE_STR="0|0|0|0|0|0|0|0" ;; esac
+fi
+
 # 帧率反馈特征: .frame_stats = 帧数|平均帧时间ms|方差ms2|0帧比例 (v3.1)
 SMOOTH=0.0
 FRAME_STATS="$MODDIR/data/collector/.frame_stats"
@@ -133,30 +142,39 @@ pkg_hash() {
 }
 HASH=$(pkg_hash "$PKG")
 
-# ---- 24 维场景特征 (逗号分隔) ----
+# ---- 33 维场景特征 (逗号分隔) ----
 # 1-10 聚合: cpu,gpu,temp,batt,chg,screen,threads,mem,hour,fgdur
 # 11   smooth(流畅度: 1=流畅/跑满, 0=卡顿) (v3.1)
-# 12-17 类别 onehot, 18-25 包名 hash
+# 12-19 8 核使用率 c0..c7 (/100) (v3.3)
+# 20-25 类别 onehot, 26-33 包名 hash
 FEAT_ALL=$(awk -v cpu="$CPU" -v gpu="$GPU" -v temp="$TEMP" -v batt="$BATT" \
     -v chg="$CHG" -v screen="$SCREEN" -v th="$THREADS_CNT" -v mem="$MEM" \
-    -v hour="$HOUR" -v fgdur="$FG_DUR" -v smooth="$SMOOTH" -v cat="$CAT" -v hash="$HASH" \
+    -v hour="$HOUR" -v fgdur="$FG_DUR" -v smooth="$SMOOTH" -v cat="$CAT" -v hash="$HASH" -v core="$CORE_STR" \
 'BEGIN {
     f[1]=cpu/100; f[2]=gpu/100; f[3]=temp/100; f[4]=batt/100; f[5]=chg
     f[6]=screen; f[7]=th/100; f[8]=mem/4096; f[9]=hour/24; f[10]=(fgdur>300)?1.0:fgdur/300
     f[11]=smooth
-    for(i=1;i<=6;i++) f[11+i]=(cat==i-1)?1:0
+    split(core, cc, "|")
+    for(i=1;i<=8;i++) f[11+i]=(cc[i]+0)/100
+    for(i=1;i<=6;i++) f[19+i]=(cat==i-1)?1:0
     split(hash, hh, " ")
-    for(i=1;i<=8;i++) f[17+i]=hh[i]+0
+    for(i=1;i<=8;i++) f[25+i]=hh[i]+0
     s=""
-    for(i=1;i<=25;i++){ if(i>1)s=s","; s=s sprintf("%.6f", f[i]) }
+    for(i=1;i<=33;i++){ if(i>1)s=s","; s=s sprintf("%.6f", f[i]) }
     print s
 }')
 
 # ---- awk 双模块前向 ----
 awk -v FEAT_ALL="$FEAT_ALL" -v ENC="$ENC" -v SCR="$SCR" -v THREADS="$THREADS_FILE" '
 BEGIN {
-    # ---- 场景编码器 (24->10) ----
-    for(i=1;i<=25;i++){ if((getline l<ENC)<=0){print "MODEL_BROKEN";exit}; split(l,r); for(j=1;j<=10;j++) W1[i,j]=r[j] }
+    # ---- 场景编码器 (25/33->10, v3.3 动态识别输入维度) ----
+    n_in=0
+    while ((getline l<ENC)>0) {
+        n_in++
+        split(l,r); for(j=1;j<=10;j++) W1[n_in,j]=r[j]
+        if (n_in >= 33) break
+    }
+    if (n_in < 25) { print "MODEL_BROKEN"; exit }
     if((getline l<ENC)<=0){print "MODEL_BROKEN";exit}; split(l,r); for(j=1;j<=10;j++) b1[j]=r[j]
     for(i=1;i<=10;i++){ if((getline l<ENC)<=0){print "MODEL_BROKEN";exit}; split(l,r); for(j=1;j<=2;j++) Wk[i,j]=r[j] }
     if((getline l<ENC)<=0){print "MODEL_BROKEN";exit}; split(l,r); for(j=1;j<=2;j++) bk[j]=r[j]
@@ -164,8 +182,8 @@ BEGIN {
     if((getline l<ENC)<=0){print "MODEL_BROKEN";exit}; split(l,r); for(j=1;j<=10;j++) bs[j]=r[j]
     close(ENC)
     split(FEAT_ALL, fa, ",")
-    for(i=1;i<=25;i++) x[i]=fa[i]+0
-    for(j=1;j<=10;j++){ z=b1[j]; for(i=1;i<=25;i++) z+=x[i]*W1[i,j]; h[j]=(z>0)?z:0 }
+    for(i=1;i<=n_in;i++) x[i]=fa[i]+0
+    for(j=1;j<=10;j++){ z=b1[j]; for(i=1;i<=n_in;i++) z+=x[i]*W1[i,j]; h[j]=(z>0)?z:0 }
     o1=bk[1]; o2=bk[2]
     for(j=1;j<=10;j++){ o1+=h[j]*Wk[j,1]; o2+=h[j]*Wk[j,2] }
     k=0.5+1.5/(1+exp(-o1)); cap=0.5+1.0/(1+exp(-o2))
@@ -189,5 +207,5 @@ BEGIN {
         printf "%s|%d|%.3f|%d\n", tname, t_cpu, score, hot
     }
     close(THREADS)
-    printf "K=%.3f CAP=%.3f\n", k, cap
+    printf "K=%.3f CAP=%.3f SMOOTH=%.3f\n", k, cap, f[11]
 }'

@@ -4,14 +4,7 @@
 ################################################################################
 
 MODDIR="/data/adb/modules/sd730-scheduler"
-# Neural Scheduler paths (v2.1)
-NN_CONF="$CONFIG_DIR/nn.conf"
-NN_MODEL="$MODDIR/model/mlp_weights.txt"
-NN_INFER="$MODDIR/bin/nn_infer.sh"
-NN_DATA_DIR="$MODDIR/data/collector"
-NN_K=1.0
-NN_CAP=1.0
-
+CORE_LOAD_FILE="$MODDIR/data/collector/.core_load"   # v3.3: 每核使用率 c0|..|c7
 CONFIG_DIR="$MODDIR/config"
 LEARNING_DB="$CONFIG_DIR/learning.db"
 PREDICTION_DB="$CONFIG_DIR/prediction.db"
@@ -557,29 +550,16 @@ get_temperature() {
         echo $((max_temp / 1000))
         return
     fi
-    # Pass 2 (fallback, v3.1.1): 只统计真正的温度传感器 (类型过滤 + 范围过滤),
-    # 避免把 lmh-dcvs/ibat/vbat/bcl/soc/step/lowf 等非温度节点误判成高温
+    # Pass 2 (fallback): max of all zones (original behavior)
     for zone in $THERMAL_ZONE/thermal_zone*/temp; do
-        [ -f "$zone" ] || continue
-        type=$(cat "${zone%/temp}/type" 2>/dev/null)
-        case "$type" in
-            *-tz|*-usr|*therm*|battery|bms) ;;
-            *) continue ;;
-        esac
-        temp=$(cat "$zone" 2>/dev/null)
-        case "$temp" in ''|*[!0-9]*) continue ;; esac
-        [ "$temp" -le 0 ] && continue
-        c=0
-        if [ "$temp" -ge 10000 ] && [ "$temp" -le 150000 ]; then
-            c=$((temp / 1000))
-        elif [ "$temp" -ge 100 ] && [ "$temp" -le 1500 ]; then
-            c=$(( (temp + 5) / 10 ))
-        elif [ "$temp" -ge 10 ] && [ "$temp" -le 150 ]; then
-            c=$temp
+        if [ -f "$zone" ]; then
+            temp=$(cat "$zone" 2>/dev/null)
+            if [ -n "$temp" ] && [ "$temp" -gt "$max_temp" ] 2>/dev/null; then
+                max_temp=$temp
+            fi
         fi
-        [ "$c" -ge 10 ] && [ "$c" -le 90 ] && [ "$c" -gt "$max_temp" ] && max_temp=$c
     done
-    echo "$max_temp"
+    echo $((max_temp / 1000))
 }
 
 # Get battery level (0-100)
@@ -2705,6 +2685,10 @@ tpin_load_conf() {
     TP_COLD_FULL=20; TP_COLD_WIDE=8; TP_COLD_MID=3
     TP_SELFM="true"; TP_SELFM_STREAK=5; TP_SELFM_INT_CPU=45
     TP_SELFM_INT_STREAK=2; TP_SELFM_OBS_MAX=8
+    # v3.3: 模型参与绑核分配 (权重式)
+    TP_NN_MANAGE="true"; TP_NN_MAX_ADJ=25
+    TP_NN_ESC="true"; TP_NN_ESC_SCORE=0.50; TP_NN_ESC_SMOOTH=0.70
+    TP_NN_BALANCE="true"; TP_NN_BALANCE_TOP=4
     [ -f "$TPIN_CONF" ] || return
     local k v
     while IFS='=' read -r k v; do
@@ -2751,6 +2735,14 @@ tpin_load_conf() {
             selfmanage_intervene_cpu) TP_SELFM_INT_CPU=$v ;;
             selfmanage_intervene_streak) TP_SELFM_INT_STREAK=$v ;;
             selfmanage_observe_max) TP_SELFM_OBS_MAX=$v ;;
+            # v3.3: 模型分配
+            nn_manage) TP_NN_MANAGE=$v ;;
+            nn_max_adjust) TP_NN_MAX_ADJ=$v ;;
+            nn_esc_enabled) TP_NN_ESC=$v ;;
+            nn_esc_score) TP_NN_ESC_SCORE=$v ;;
+            nn_esc_smooth) TP_NN_ESC_SMOOTH=$v ;;
+            nn_balance_little) TP_NN_BALANCE=$v ;;
+            nn_balance_top) TP_NN_BALANCE_TOP=$v ;;
         esac
     done < "$TPIN_CONF"
     # Numeric sanitation: garbage falls back to the defaults.
@@ -2789,6 +2781,11 @@ tpin_load_conf() {
     case "$TP_SELFM_INT_CPU" in ''|*[!0-9]*) TP_SELFM_INT_CPU=45 ;; esac
     case "$TP_SELFM_INT_STREAK" in ''|*[!0-9]*) TP_SELFM_INT_STREAK=2 ;; esac
     case "$TP_SELFM_OBS_MAX" in ''|*[!0-9]*) TP_SELFM_OBS_MAX=8 ;; esac
+    case "$TP_NN_MAX_ADJ" in ''|*[!0-9]*) TP_NN_MAX_ADJ=25 ;; esac
+    [ "$TP_NN_MAX_ADJ" -gt 50 ] 2>/dev/null && TP_NN_MAX_ADJ=50
+    case "$TP_NN_ESC_SCORE" in ''|*[!0-9.]*) TP_NN_ESC_SCORE=0.50 ;; esac
+    case "$TP_NN_ESC_SMOOTH" in ''|*[!0-9.]*) TP_NN_ESC_SMOOTH=0.70 ;; esac
+    case "$TP_NN_BALANCE_TOP" in ''|*[!0-9]*) TP_NN_BALANCE_TOP=4 ;; esac
     # normalize both masks: lowercase hex without 0x prefix / leading zeros,
     # so string comparisons with read-back masks are exact. (The binding core
     # re-normalizes again at bind time, incl. decimal-trap self-healing.)
@@ -3231,32 +3228,11 @@ cold_thread_mask() {
     local cval=$((0x$coarse))
     local lbits=$((cval & 0x3f))
     if [ "$lbits" -eq 0 ]; then COLD_MASK=$coarse; return; fi
-    # Dynamic thresholds + warmup boost (v2.1)
-    local _tp_full=$TP_COLD_FULL _tp_wide=$TP_COLD_WIDE _tp_mid=$TP_COLD_MID
-    if [ "$(awk "BEGIN {print ($NN_K != 1.0) ? 1 : 0}")" -eq 1 ]; then
-        _tp_full=$(awk "BEGIN {print int(20 / $NN_K)}")
-        _tp_wide=$(awk "BEGIN {print int(8 / $NN_K)}")
-        _tp_mid=$(awk "BEGIN {print int(3 / $NN_K)}")
-        [ "$_tp_full" -lt 5 ] && _tp_full=5
-        [ "$_tp_wide" -lt 2 ] && _tp_wide=2
-        [ "$_tp_mid" -lt 1 ] && _tp_mid=1
-    fi
-    # Warmup boost: app just switched to foreground -> more aggressive
-    local _warmup_boost=0
-    if [ -f "$NN_DATA_DIR/.fg_duration" ]; then
-        local _fg_dur=$(cat "$NN_DATA_DIR/.fg_duration" 2>/dev/null)
-        case "$_fg_dur" in ''|*[!0-9]*) _fg_dur=999 ;; esac
-        if [ "$_fg_dur" -lt "$nn_warmup_sec" ] 2>/dev/null; then
-            _warmup_boost=$(awk "BEGIN {print int($nn_warmup_boost * 100)}")
-        fi
-    fi
-    cpu=$((cpu + _warmup_boost))
-    [ "$cpu" -gt 100 ] && cpu=100
-    if [ "$cpu" -ge "$_tp_full" ]; then COLD_MASK=$coarse; return; fi
+    if [ "$cpu" -ge "$TP_COLD_FULL" ]; then COLD_MASK=$coarse; return; fi
     local m
-    if [ "$cpu" -ge "$_tp_wide" ]; then
+    if [ "$cpu" -ge "$TP_COLD_WIDE" ]; then
         m=$lbits
-    elif [ "$cpu" -ge "$_tp_mid" ]; then
+    elif [ "$cpu" -ge "$TP_COLD_MID" ]; then
         m=$((lbits & 0x0f)); [ "$m" -eq 0 ] && m=$lbits
     else
         m=$((lbits & 0x03)); [ "$m" -eq 0 ] && m=$((lbits & 0x0f)); [ "$m" -eq 0 ] && m=$lbits
@@ -3270,44 +3246,6 @@ cold_thread_mask() {
 
 apply_app_affinity_smart() {
     local pkg=$1
-    # ---- NN aggressiveness + elastic budget (v2.1) ----
-    NN_K=1.0
-    NN_CAP=1.0
-    local nn_enabled="true" nn_alpha=0.0 nn_temp_limit=70
-    local nn_warmup_sec=3 nn_warmup_boost=0.3
-    if [ -f "$NN_CONF" ]; then
-        nn_enabled=$(grep "^nn_enabled=" "$NN_CONF" 2>/dev/null | cut -d'=' -f2-)
-        nn_alpha=$(grep "^nn_alpha=" "$NN_CONF" 2>/dev/null | cut -d'=' -f2-)
-        nn_temp_limit=$(grep "^nn_temp_limit=" "$NN_CONF" 2>/dev/null | cut -d'=' -f2-)
-        nn_warmup_sec=$(grep "^nn_warmup_seconds=" "$NN_CONF" 2>/dev/null | cut -d'=' -f2-)
-        nn_warmup_boost=$(grep "^nn_warmup_k_boost=" "$NN_CONF" 2>/dev/null | cut -d'=' -f2-)
-        case "$nn_alpha" in ''|*[!0-9.]*) nn_alpha=0.0 ;; esac
-        case "$nn_temp_limit" in ''|*[!0-9]*) nn_temp_limit=70 ;; esac
-        case "$nn_warmup_sec" in ''|*[!0-9]*) nn_warmup_sec=3 ;; esac
-        case "$nn_warmup_boost" in ''|*[!0-9.]*) nn_warmup_boost=0.3 ;; esac
-    fi
-    local temp_now=$(get_temperature 2>/dev/null || echo 0)
-    if [ "$temp_now" -gt "$nn_temp_limit" ] 2>/dev/null; then
-        nn_alpha=0.0
-    fi
-    if [ "$nn_enabled" = "true" ] && \
-       [ "$(awk "BEGIN {print ($nn_alpha > 0) ? 1 : 0}")" -eq 1 ] && \
-       [ -x "$NN_INFER" ]; then
-        local nn_out=$("$NN_INFER" 2>/dev/null)
-        if [ -n "$nn_out" ]; then
-            # v3.1 merge fix: 原代码用 bash 专属 here-string `<<<` (dash/严格
-            # POSIX sh 会直接解析报错), 改为 POSIX 兼容写法。
-            local k_raw=$(echo "$nn_out" | awk '{print $1}')
-            local cap_raw=$(echo "$nn_out" | awk '{print $2}')
-            case "$k_raw" in ''|*[!0-9.]*) k_raw=1.0 ;; esac
-            case "$cap_raw" in ''|*[!0-9.]*) cap_raw=1.0 ;; esac
-            NN_K=$(awk "BEGIN {print ($k_raw < 0.5) ? 0.5 : ($k_raw > 2.0) ? 2.0 : $k_raw}")
-            NN_CAP=$(awk "BEGIN {print ($cap_raw < 0.5) ? 0.5 : ($cap_raw > 1.5) ? 1.5 : $cap_raw}")
-            log_msg "[NN] k=$NN_K cap=$NN_CAP alpha=$nn_alpha temp=${temp_now}C"
-        fi
-    fi
-    # ---- NN read end ----
-
     local mode=$2
     local OLD_IFS=$IFS
 
@@ -3324,6 +3262,21 @@ apply_app_affinity_smart() {
     fi
 
     local now=$(date +%s)
+
+    # ---- v3.3: 模型分数 (权重式干扰, 不硬替换规则) ----
+    local nn_scores="" nn_ok=0 nn_top=0.0 nn_smooth=1.0
+    if [ "$TP_NN_MANAGE" = "true" ] && [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && [ -f "$MODDIR/model/mlp_v3_scr.txt" ]; then
+        nn_scores=$(sh "$MODDIR/bin/nn_infer_v3.sh" 2>/dev/null)
+        case "$nn_scores" in
+            *\|*)
+                nn_ok=1
+                nn_top=$(printf '%s\n' "$nn_scores" | grep -v '^K=' | awk -F'|' '{if($3+0>m)m=$3+0} END{printf "%.3f", m+0}')
+                nn_smooth=$(printf '%s\n' "$nn_scores" | sed -n 's/^K=.* SMOOTH=\([0-9.]*\).*/\1/p' | head -1)
+                case "$nn_smooth" in ''|*[!0-9.]*) nn_smooth=1.0 ;; esac
+                ;;
+            *) nn_ok=0 ;;
+        esac
+    fi
 
     # ---- previous cycle state (TID lines cached in TP_S_<tid> vars) ----
     local s_pkg="" s_exp=0 s_expanded=0 s_con=0
@@ -3411,6 +3364,7 @@ $hname
     local live_tids=""
     local cand_list="" n_cand=0
     local keep_list="" n_keep=0
+    local bl_pool=""          # v3.3: 小核均衡候选池 tid|score|cpu
     local learn_updates=""
     local hot_list="" app_load=0
     local pid tp tid comm statline rest u s j_cur st_cur
@@ -3543,18 +3497,33 @@ $comm
             fi
             app_load=$((app_load + cpu))
 
-            # Keep / candidate classification
+            # Keep / candidate classification (v3.3: 模型分数加权)
+            # 行格式 cpu|eff|tid; eff=负载+模型偏移(±nn_max_adjust), 排序用 eff
+            local nn_adj=0
+            local bl_meta=""
+            if [ "$nn_ok" = 1 ]; then
+                local nns=0.5
+                nns=$(printf '%s\n' "$nn_scores" | awk -F'|' -v n="$comm" '$1==n {print $3; exit}')
+                case "$nns" in ''|*[!0-9.]*) nns=0.5 ;; esac
+                nn_adj=$(awk "BEGIN{a=($nns-0.5)*2*$TP_NN_MAX_ADJ; if(a>$TP_NN_MAX_ADJ)a=$TP_NN_MAX_ADJ; if(a< -$TP_NN_MAX_ADJ)a= -$TP_NN_MAX_ADJ; printf \"%d\", a}")
+                bl_meta="${tid}|${nns}|${cpu}"
+            fi
+            local eff=$((cpu + nn_adj))
+            [ "$eff" -lt 0 ] && eff=0
+            [ "$eff" -gt 100 ] && eff=100
             if [ "$blacklisted" = 0 ]; then
+                [ -n "$bl_meta" ] && bl_pool="${bl_pool}${bl_meta}
+"
                 if [ "$prev_target" = "$big_mask" ]; then
                     # pinned last cycle: keep unless it went cold for good
                     if [ "$cold_s" -lt "$TP_REL_STREAK" ]; then
-                        keep_list="${keep_list}${cpu}|${tid}
+                        keep_list="${keep_list}${cpu}|${eff}|${tid}
 "
                         n_keep=$((n_keep + 1))
                     fi
                 elif { [ "$hot_s" -ge "$TP_HOT_STREAK" ] || [ "$learned" = 1 ]; } && \
                      [ "$cold_s" -lt "$TP_REL_STREAK" ]; then
-                    cand_list="${cand_list}${cpu}|${tid}
+                    cand_list="${cand_list}${cpu}|${eff}|${tid}
 "
                     n_cand=$((n_cand + 1))
                 fi
@@ -3717,6 +3686,13 @@ $comm
     # (meaningful only while managing; in observe/monitor mode nothing is
     # pinned, so skip the trigger bookkeeping and its log spam)
     local pair=$((top1 + top2))
+    # v3.3: escalate(2->3) 需模型认可 (模型最高分>=门槛 且 场景卡顿) 才允许
+    local nn_esc_ok=1
+    if [ "$TP_NN_ESC" = "true" ] && [ "$nn_ok" = 1 ]; then
+        nn_esc_ok=0
+        [ "$(awk "BEGIN{print ($nn_top >= $TP_NN_ESC_SCORE)?1:0}")" = 1 ] && \
+        [ "$(awk "BEGIN{print ($nn_smooth <= $TP_NN_ESC_SMOOTH)?1:0}")" = 1 ] && nn_esc_ok=1
+    fi
     if [ "$sm_mode" != "manage" ]; then
         :
     elif [ "$temp" -ge "$TP_ESC_TEMP" ]; then
@@ -3724,7 +3700,7 @@ $comm
             s_expanded=0; s_exp=0; s_con=0
             log_msg "[TPIN] $pkg: big-core budget 3->2 (temp ${temp}C >= ${TP_ESC_TEMP}C)"
         fi
-    elif [ "$top3" -ge "$TP_ESC_TH" ] && [ "$pair" -ge "$TP_ESC_PAIR" ]; then
+    elif [ "$top3" -ge "$TP_ESC_TH" ] && [ "$pair" -ge "$TP_ESC_PAIR" ] && [ "$nn_esc_ok" = 1 ]; then
         s_exp=$((s_exp + 1)); s_con=0
         if [ "$s_exp" -ge "$TP_ESC_STREAK" ] && [ "$s_expanded" = 0 ]; then
             s_expanded=1
@@ -3742,21 +3718,9 @@ $comm
     else
         s_exp=0
     fi
-
-    # ---- NN elastic budget adjustment (v2.1) ----
-    local _tp_base=$TP_BASE_CAP _tp_max=$TP_MAX_CAP
-    if [ "$(awk "BEGIN {print ($NN_CAP != 1.0) ? 1 : 0}")" -eq 1 ]; then
-        _tp_base=$(awk "BEGIN {print int($TP_BASE_CAP * $NN_CAP)}")
-        _tp_max=$(awk "BEGIN {print int($TP_MAX_CAP * $NN_CAP)}")
-        [ "$_tp_base" -lt 1 ] && _tp_base=1
-        [ "$_tp_max" -lt 1 ] && _tp_max=1
-        [ "$_tp_base" -gt 6 ] && _tp_base=6
-        [ "$_tp_max" -gt 6 ] && _tp_max=6
-    fi
-    local cap=$_tp_base
-    [ "$s_expanded" = 1 ] && cap=$_tp_max
-    [ "$cap" -gt "$_tp_max" ] && cap=$_tp_max
-    # ---- NN budget end ----
+    local cap=$TP_BASE_CAP
+    [ "$s_expanded" = 1 ] && cap=$TP_MAX_CAP
+    [ "$cap" -gt "$TP_MAX_CAP" ] && cap=$TP_MAX_CAP
 
     # ---- pick who gets the slots: keepers vs candidates, BY LOAD ----------
     # Old behavior: keepers held their slot unconditionally until they went
@@ -3772,7 +3736,7 @@ $comm
     local hold_keep="" hold_cand="" n_hold=0
     if [ "$sm_mode" = "manage" ]; then
         if [ "$n_keep" -gt 1 ]; then
-            keep_list=$(printf '%s' "$keep_list" | sort -t'|' -k1,1 -rn)
+            keep_list=$(printf '%s' "$keep_list" | sort -t'|' -k2,2 -rn)   # v3.3: eff 排序
         fi
         if [ "$n_keep" -gt "$cap" ]; then
             keep_list=$(printf '%s' "$keep_list" | head -n "$cap")
@@ -3784,50 +3748,8 @@ $comm
             n_hold=$((n_hold + 1))
         done
         if [ "$n_cand" -gt 1 ]; then
-            cand_list=$(printf '%s' "$cand_list" | sort -t'|' -k1,1 -rn)
+            cand_list=$(printf '%s' "$cand_list" | sort -t'|' -k2,2 -rn)   # v3.3: eff 排序
         fi
-    # ---- v3.0: model-score reordering (optional, off by default) ----
-    # cand_list/keep_list 每行 "cpu|tid"。开启后按 v3_decision.sh 的模型分数
-    # 重排 (无分数线程用 cpu 兜底), 让模型判定收益高的线程优先获得 big 槽位。
-    # 模型缺失 / NO_MODEL / 关闭 -> 完全回退原 CPU% 排序。
-    local v3_on=0
-    if [ -f "$CONFIG_DIR/v3.conf" ]; then
-        case "$(grep '^v3_enabled=' "$CONFIG_DIR/v3.conf" 2>/dev/null | cut -d'=' -f2-)" in
-            true) v3_on=1 ;;
-        esac
-    fi
-    if [ "$v3_on" = "1" ] && [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && \
-       [ -f "$MODDIR/model/mlp_v3_scr.txt" ] && [ -x "$MODDIR/bin/v3_decision.sh" ]; then
-        local v3_scores
-        v3_scores=$("$MODDIR/bin/v3_decision.sh" 2>/dev/null)
-        case "$v3_scores" in
-            ""|NO_MODEL|NO_STATE|NO_THREADS) ;;
-            *)
-                local _ll _lk _ltid _lsc _lcpu _rlist=""
-                v3_reorder_list() {
-                    local _list="$1" _scores="$2" _line _tid _cpu _score
-                    _rlist=""
-                    while IFS= read -r _line; do
-                        [ -z "$_line" ] && continue
-                        _cpu=${_line%%|*}; _tid=${_line##*|}
-                        _score=$(echo "$_scores" | awk -F'|' -v t="$_tid" '$1==t {print $2; exit}')
-                        case "$_score" in ''|*[!0-9.]*) _score=-1 ;; esac
-                        printf '%s\n' "${_score}|${_cpu}|${_tid}"
-                    done <<V3EOF
-$_list
-V3EOF
-                }
-                if [ "$n_keep" -gt 1 ]; then
-                    keep_list=$(v3_reorder_list "$keep_list" "$v3_scores" | sort -t'|' -k1,1 -rn | awk -F'|' '{print $2"|"$3}')
-                fi
-                if [ "$n_cand" -gt 1 ]; then
-                    cand_list=$(v3_reorder_list "$cand_list" "$v3_scores" | sort -t'|' -k1,1 -rn | awk -F'|' '{print $2"|"$3}')
-                fi
-                ;;
-        esac
-    fi
-    # ---- v3 reorder end ----
-
         for kl in $cand_list; do
             ccpu=${kl%%|*}
             case "$ccpu" in ''|*[!0-9]*) continue ;; esac
@@ -3858,6 +3780,48 @@ V3EOF
             fi
         done
         for kl in $hold_keep $hold_cand; do big_tids="${big_tids}${kl##*|} "; done
+    fi
+
+    # ---- v3.3: 小核均衡分配器 ----
+    # 模型分数前 N 名的未绑线程, least-loaded 分配到 cpu0-5 (让每个小核负载趋均)
+    # 折中策略: 只重排高分前 N 名, 其余保持 COLD_MASK 不动, 避免线程频繁跳动
+    local little_plan=""
+    if [ "$TP_NN_BALANCE" = "true" ] && [ "$nn_ok" = 1 ] && [ "$sm_mode" = "manage" ] && [ -n "$bl_pool" ]; then
+        local pl_cands="" pl_line pl_tid pl_s pl_c
+        for pl_line in $bl_pool; do
+            pl_tid=${pl_line%%|*}; pl_rest=${pl_line#*|}; pl_s=${pl_rest%%|*}; pl_c=${pl_rest##*|}
+            case "$big_tids" in
+                *" $pl_tid "*) ;;
+                *) pl_cands="${pl_cands}${pl_s}|${pl_tid}
+" ;;
+            esac
+        done
+        pl_cands=$(printf '%b' "$pl_cands" | sort -t'|' -k1,1 -rn | head -n "$TP_NN_BALANCE_TOP")
+        if [ -n "$pl_cands" ]; then
+            local cl0=0 cl1=0 cl2=0 cl3=0 cl4=0 cl5=0 cl6=0 cl7=0
+            IFS='|' read -r cl0 cl1 cl2 cl3 cl4 cl5 cl6 cl7 < "$CORE_LOAD_FILE" 2>/dev/null
+            case "$cl0$cl1$cl2$cl3$cl4$cl5" in ''|*[!0-9]*) cl0=0; cl1=0; cl2=0; cl3=0; cl4=0; cl5=0 ;; esac
+            local l0=$cl0 l1=$cl1 l2=$cl2 l3=$cl3 l4=$cl4 l5=$cl5
+            local pl2 pl_best_v pl_best_n pl_maskhex pl_tid2 pl_s2
+            for pl2 in $pl_cands; do
+                pl_s2=${pl2%%|*}; pl_tid2=${pl2##*|}
+                pl_best_v=$l0; pl_best_n=0
+                [ "$l1" -lt "$pl_best_v" ] && { pl_best_v=$l1; pl_best_n=1; }
+                [ "$l2" -lt "$pl_best_v" ] && { pl_best_v=$l2; pl_best_n=2; }
+                [ "$l3" -lt "$pl_best_v" ] && { pl_best_v=$l3; pl_best_n=3; }
+                [ "$l4" -lt "$pl_best_v" ] && { pl_best_v=$l4; pl_best_n=4; }
+                [ "$l5" -lt "$pl_best_v" ] && { pl_best_v=$l5; pl_best_n=5; }
+                pl_maskhex=$(printf '%x' $((1 << pl_best_n)))
+                little_plan="${little_plan}${pl_tid2}|${pl_maskhex}
+"
+                # 占位: 该核负载 +20, 防多个高分线程挤同一核
+                case "$pl_best_n" in
+                    0) l0=$((l0 + 20)) ;; 1) l1=$((l1 + 20)) ;;
+                    2) l2=$((l2 + 20)) ;; 3) l3=$((l3 + 20)) ;;
+                    4) l4=$((l4 + 20)) ;; 5) l5=$((l5 + 20)) ;;
+                esac
+            done
+        fi
     fi
 
     # ---- pass 2: apply --------------------------------------------------
@@ -3894,12 +3858,24 @@ V3EOF
             *" $tid2 "*)
                 target=$big_mask ;;
             *)
-                # Unpinned thread: never the raw coarse mask - narrow it by
-                # this thread's OWN load (idle threads huddle on cpu0-1,
-                # busier ones spread over cpu0-5, only near-hot ones may use
-                # the coarse mask's big-core bits). fork-free via COLD_MASK.
-                cold_thread_mask "$4" "$coarse"
-                target=$COLD_MASK ;;
+                # v3.3: 小核均衡计划命中 -> 绑计划核 (模型分数前N, least-loaded)
+                if [ -n "$little_plan" ]; then
+                    local plan_mask=""
+                    plan_mask=$(printf '%b' "$little_plan" | awk -F'|' -v t="$tid2" '$1==t {print $2; exit}')
+                    if [ -n "$plan_mask" ]; then
+                        target=$plan_mask
+                    else
+                        # Unpinned thread: never the raw coarse mask - narrow it by
+                        # this thread's OWN load (idle threads huddle on cpu0-1,
+                        # busier ones spread over cpu0-5, only near-hot ones may use
+                        # the coarse mask's big-core bits). fork-free via COLD_MASK.
+                        cold_thread_mask "$4" "$coarse"
+                        target=$COLD_MASK
+                    fi
+                else
+                    cold_thread_mask "$4" "$coarse"
+                    target=$COLD_MASK
+                fi ;;
         esac
         applied=$8
         orig=$9
@@ -4443,21 +4419,3 @@ reset_prediction() {
     rm -f "$PREDICTION_ACTIVE"
     echo "[+] Prediction database reset (first/second-order chains, time context, state)."
 }
-
-# ============================================================================
-# NN v3.1 (merge fix): 采集器自愈启动
-#
-# 无论模块由哪个入口加载 (service.sh / post-fs-data.sh / CLI / --daemon /
-# 旧版 service.sh), 只要 functions.sh 被 source 到此即确保采集器在运行。
-# 这修复了"合并/覆盖安装后开机采集器不启动, 必须手动跑 collector.sh"的问题:
-#   - 新模块的 service.sh / post-fs-data.sh 已把 ensure 提到最前;
-#   - 这里再兜底一次: 若设备上仍是旧版 service.sh (从不调用 ensure),
-#     只要它 source 了本文件, 采集器照样会被拉起。
-# ensure_collector.sh 自身幂等 (PID文件+pgrep+锁), 重复调用开销 <10ms, 无害。
-# 注意: collector.sh 不 source 本文件, 不会形成递归。
-# 用 -f 而非 -x: 手动合并安装 (未跑 customize.sh) 时脚本可能没有执行位,
-# 反正这里是 `sh 脚本` 调用, 无需执行位。
-# ============================================================================
-[ -f "$MODDIR/bin/ensure_collector.sh" ] && \
-    sh "$MODDIR/bin/ensure_collector.sh" sourced
-

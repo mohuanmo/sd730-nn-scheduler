@@ -4,6 +4,7 @@
 ################################################################################
 
 MODDIR="/data/adb/modules/sd730-scheduler"
+CORE_LOAD_FILE="$MODDIR/data/collector/.core_load"   # v3.3: 每核使用率 c0|..|c7
 CONFIG_DIR="$MODDIR/config"
 LEARNING_DB="$CONFIG_DIR/learning.db"
 PREDICTION_DB="$CONFIG_DIR/prediction.db"
@@ -2684,6 +2685,10 @@ tpin_load_conf() {
     TP_COLD_FULL=20; TP_COLD_WIDE=8; TP_COLD_MID=3
     TP_SELFM="true"; TP_SELFM_STREAK=5; TP_SELFM_INT_CPU=45
     TP_SELFM_INT_STREAK=2; TP_SELFM_OBS_MAX=8
+    # v3.3: 模型参与绑核分配 (权重式)
+    TP_NN_MANAGE="true"; TP_NN_MAX_ADJ=25
+    TP_NN_ESC="true"; TP_NN_ESC_SCORE=0.50; TP_NN_ESC_SMOOTH=0.70
+    TP_NN_BALANCE="true"; TP_NN_BALANCE_TOP=4
     [ -f "$TPIN_CONF" ] || return
     local k v
     while IFS='=' read -r k v; do
@@ -2730,6 +2735,14 @@ tpin_load_conf() {
             selfmanage_intervene_cpu) TP_SELFM_INT_CPU=$v ;;
             selfmanage_intervene_streak) TP_SELFM_INT_STREAK=$v ;;
             selfmanage_observe_max) TP_SELFM_OBS_MAX=$v ;;
+            # v3.3: 模型分配
+            nn_manage) TP_NN_MANAGE=$v ;;
+            nn_max_adjust) TP_NN_MAX_ADJ=$v ;;
+            nn_esc_enabled) TP_NN_ESC=$v ;;
+            nn_esc_score) TP_NN_ESC_SCORE=$v ;;
+            nn_esc_smooth) TP_NN_ESC_SMOOTH=$v ;;
+            nn_balance_little) TP_NN_BALANCE=$v ;;
+            nn_balance_top) TP_NN_BALANCE_TOP=$v ;;
         esac
     done < "$TPIN_CONF"
     # Numeric sanitation: garbage falls back to the defaults.
@@ -2768,6 +2781,11 @@ tpin_load_conf() {
     case "$TP_SELFM_INT_CPU" in ''|*[!0-9]*) TP_SELFM_INT_CPU=45 ;; esac
     case "$TP_SELFM_INT_STREAK" in ''|*[!0-9]*) TP_SELFM_INT_STREAK=2 ;; esac
     case "$TP_SELFM_OBS_MAX" in ''|*[!0-9]*) TP_SELFM_OBS_MAX=8 ;; esac
+    case "$TP_NN_MAX_ADJ" in ''|*[!0-9]*) TP_NN_MAX_ADJ=25 ;; esac
+    [ "$TP_NN_MAX_ADJ" -gt 50 ] 2>/dev/null && TP_NN_MAX_ADJ=50
+    case "$TP_NN_ESC_SCORE" in ''|*[!0-9.]*) TP_NN_ESC_SCORE=0.50 ;; esac
+    case "$TP_NN_ESC_SMOOTH" in ''|*[!0-9.]*) TP_NN_ESC_SMOOTH=0.70 ;; esac
+    case "$TP_NN_BALANCE_TOP" in ''|*[!0-9]*) TP_NN_BALANCE_TOP=4 ;; esac
     # normalize both masks: lowercase hex without 0x prefix / leading zeros,
     # so string comparisons with read-back masks are exact. (The binding core
     # re-normalizes again at bind time, incl. decimal-trap self-healing.)
@@ -3245,6 +3263,21 @@ apply_app_affinity_smart() {
 
     local now=$(date +%s)
 
+    # ---- v3.3: 模型分数 (权重式干扰, 不硬替换规则) ----
+    local nn_scores="" nn_ok=0 nn_top=0.0 nn_smooth=1.0
+    if [ "$TP_NN_MANAGE" = "true" ] && [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && [ -f "$MODDIR/model/mlp_v3_scr.txt" ]; then
+        nn_scores=$(sh "$MODDIR/bin/nn_infer_v3.sh" 2>/dev/null)
+        case "$nn_scores" in
+            *\|*)
+                nn_ok=1
+                nn_top=$(printf '%s\n' "$nn_scores" | grep -v '^K=' | awk -F'|' '{if($3+0>m)m=$3+0} END{printf "%.3f", m+0}')
+                nn_smooth=$(printf '%s\n' "$nn_scores" | sed -n 's/^K=.* SMOOTH=\([0-9.]*\).*/\1/p' | head -1)
+                case "$nn_smooth" in ''|*[!0-9.]*) nn_smooth=1.0 ;; esac
+                ;;
+            *) nn_ok=0 ;;
+        esac
+    fi
+
     # ---- previous cycle state (TID lines cached in TP_S_<tid> vars) ----
     local s_pkg="" s_exp=0 s_expanded=0 s_con=0
     local prev_tids=""
@@ -3331,6 +3364,7 @@ $hname
     local live_tids=""
     local cand_list="" n_cand=0
     local keep_list="" n_keep=0
+    local bl_pool=""          # v3.3: 小核均衡候选池 tid|score|cpu
     local learn_updates=""
     local hot_list="" app_load=0
     local pid tp tid comm statline rest u s j_cur st_cur
@@ -3463,18 +3497,33 @@ $comm
             fi
             app_load=$((app_load + cpu))
 
-            # Keep / candidate classification
+            # Keep / candidate classification (v3.3: 模型分数加权)
+            # 行格式 cpu|eff|tid; eff=负载+模型偏移(±nn_max_adjust), 排序用 eff
+            local nn_adj=0
+            local bl_meta=""
+            if [ "$nn_ok" = 1 ]; then
+                local nns=0.5
+                nns=$(printf '%s\n' "$nn_scores" | awk -F'|' -v n="$comm" '$1==n {print $3; exit}')
+                case "$nns" in ''|*[!0-9.]*) nns=0.5 ;; esac
+                nn_adj=$(awk "BEGIN{a=($nns-0.5)*2*$TP_NN_MAX_ADJ; if(a>$TP_NN_MAX_ADJ)a=$TP_NN_MAX_ADJ; if(a< -$TP_NN_MAX_ADJ)a= -$TP_NN_MAX_ADJ; printf \"%d\", a}")
+                bl_meta="${tid}|${nns}|${cpu}"
+            fi
+            local eff=$((cpu + nn_adj))
+            [ "$eff" -lt 0 ] && eff=0
+            [ "$eff" -gt 100 ] && eff=100
             if [ "$blacklisted" = 0 ]; then
+                [ -n "$bl_meta" ] && bl_pool="${bl_pool}${bl_meta}
+"
                 if [ "$prev_target" = "$big_mask" ]; then
                     # pinned last cycle: keep unless it went cold for good
                     if [ "$cold_s" -lt "$TP_REL_STREAK" ]; then
-                        keep_list="${keep_list}${cpu}|${tid}
+                        keep_list="${keep_list}${cpu}|${eff}|${tid}
 "
                         n_keep=$((n_keep + 1))
                     fi
                 elif { [ "$hot_s" -ge "$TP_HOT_STREAK" ] || [ "$learned" = 1 ]; } && \
                      [ "$cold_s" -lt "$TP_REL_STREAK" ]; then
-                    cand_list="${cand_list}${cpu}|${tid}
+                    cand_list="${cand_list}${cpu}|${eff}|${tid}
 "
                     n_cand=$((n_cand + 1))
                 fi
@@ -3637,6 +3686,13 @@ $comm
     # (meaningful only while managing; in observe/monitor mode nothing is
     # pinned, so skip the trigger bookkeeping and its log spam)
     local pair=$((top1 + top2))
+    # v3.3: escalate(2->3) 需模型认可 (模型最高分>=门槛 且 场景卡顿) 才允许
+    local nn_esc_ok=1
+    if [ "$TP_NN_ESC" = "true" ] && [ "$nn_ok" = 1 ]; then
+        nn_esc_ok=0
+        [ "$(awk "BEGIN{print ($nn_top >= $TP_NN_ESC_SCORE)?1:0}")" = 1 ] && \
+        [ "$(awk "BEGIN{print ($nn_smooth <= $TP_NN_ESC_SMOOTH)?1:0}")" = 1 ] && nn_esc_ok=1
+    fi
     if [ "$sm_mode" != "manage" ]; then
         :
     elif [ "$temp" -ge "$TP_ESC_TEMP" ]; then
@@ -3644,7 +3700,7 @@ $comm
             s_expanded=0; s_exp=0; s_con=0
             log_msg "[TPIN] $pkg: big-core budget 3->2 (temp ${temp}C >= ${TP_ESC_TEMP}C)"
         fi
-    elif [ "$top3" -ge "$TP_ESC_TH" ] && [ "$pair" -ge "$TP_ESC_PAIR" ]; then
+    elif [ "$top3" -ge "$TP_ESC_TH" ] && [ "$pair" -ge "$TP_ESC_PAIR" ] && [ "$nn_esc_ok" = 1 ]; then
         s_exp=$((s_exp + 1)); s_con=0
         if [ "$s_exp" -ge "$TP_ESC_STREAK" ] && [ "$s_expanded" = 0 ]; then
             s_expanded=1
@@ -3680,7 +3736,7 @@ $comm
     local hold_keep="" hold_cand="" n_hold=0
     if [ "$sm_mode" = "manage" ]; then
         if [ "$n_keep" -gt 1 ]; then
-            keep_list=$(printf '%s' "$keep_list" | sort -t'|' -k1,1 -rn)
+            keep_list=$(printf '%s' "$keep_list" | sort -t'|' -k2,2 -rn)   # v3.3: eff 排序
         fi
         if [ "$n_keep" -gt "$cap" ]; then
             keep_list=$(printf '%s' "$keep_list" | head -n "$cap")
@@ -3692,7 +3748,7 @@ $comm
             n_hold=$((n_hold + 1))
         done
         if [ "$n_cand" -gt 1 ]; then
-            cand_list=$(printf '%s' "$cand_list" | sort -t'|' -k1,1 -rn)
+            cand_list=$(printf '%s' "$cand_list" | sort -t'|' -k2,2 -rn)   # v3.3: eff 排序
         fi
         for kl in $cand_list; do
             ccpu=${kl%%|*}
@@ -3724,6 +3780,48 @@ $comm
             fi
         done
         for kl in $hold_keep $hold_cand; do big_tids="${big_tids}${kl##*|} "; done
+    fi
+
+    # ---- v3.3: 小核均衡分配器 ----
+    # 模型分数前 N 名的未绑线程, least-loaded 分配到 cpu0-5 (让每个小核负载趋均)
+    # 折中策略: 只重排高分前 N 名, 其余保持 COLD_MASK 不动, 避免线程频繁跳动
+    local little_plan=""
+    if [ "$TP_NN_BALANCE" = "true" ] && [ "$nn_ok" = 1 ] && [ "$sm_mode" = "manage" ] && [ -n "$bl_pool" ]; then
+        local pl_cands="" pl_line pl_tid pl_s pl_c
+        for pl_line in $bl_pool; do
+            pl_tid=${pl_line%%|*}; pl_rest=${pl_line#*|}; pl_s=${pl_rest%%|*}; pl_c=${pl_rest##*|}
+            case "$big_tids" in
+                *" $pl_tid "*) ;;
+                *) pl_cands="${pl_cands}${pl_s}|${pl_tid}
+" ;;
+            esac
+        done
+        pl_cands=$(printf '%b' "$pl_cands" | sort -t'|' -k1,1 -rn | head -n "$TP_NN_BALANCE_TOP")
+        if [ -n "$pl_cands" ]; then
+            local cl0=0 cl1=0 cl2=0 cl3=0 cl4=0 cl5=0 cl6=0 cl7=0
+            IFS='|' read -r cl0 cl1 cl2 cl3 cl4 cl5 cl6 cl7 < "$CORE_LOAD_FILE" 2>/dev/null
+            case "$cl0$cl1$cl2$cl3$cl4$cl5" in ''|*[!0-9]*) cl0=0; cl1=0; cl2=0; cl3=0; cl4=0; cl5=0 ;; esac
+            local l0=$cl0 l1=$cl1 l2=$cl2 l3=$cl3 l4=$cl4 l5=$cl5
+            local pl2 pl_best_v pl_best_n pl_maskhex pl_tid2 pl_s2
+            for pl2 in $pl_cands; do
+                pl_s2=${pl2%%|*}; pl_tid2=${pl2##*|}
+                pl_best_v=$l0; pl_best_n=0
+                [ "$l1" -lt "$pl_best_v" ] && { pl_best_v=$l1; pl_best_n=1; }
+                [ "$l2" -lt "$pl_best_v" ] && { pl_best_v=$l2; pl_best_n=2; }
+                [ "$l3" -lt "$pl_best_v" ] && { pl_best_v=$l3; pl_best_n=3; }
+                [ "$l4" -lt "$pl_best_v" ] && { pl_best_v=$l4; pl_best_n=4; }
+                [ "$l5" -lt "$pl_best_v" ] && { pl_best_v=$l5; pl_best_n=5; }
+                pl_maskhex=$(printf '%x' $((1 << pl_best_n)))
+                little_plan="${little_plan}${pl_tid2}|${pl_maskhex}
+"
+                # 占位: 该核负载 +20, 防多个高分线程挤同一核
+                case "$pl_best_n" in
+                    0) l0=$((l0 + 20)) ;; 1) l1=$((l1 + 20)) ;;
+                    2) l2=$((l2 + 20)) ;; 3) l3=$((l3 + 20)) ;;
+                    4) l4=$((l4 + 20)) ;; 5) l5=$((l5 + 20)) ;;
+                esac
+            done
+        fi
     fi
 
     # ---- pass 2: apply --------------------------------------------------
@@ -3760,12 +3858,24 @@ $comm
             *" $tid2 "*)
                 target=$big_mask ;;
             *)
-                # Unpinned thread: never the raw coarse mask - narrow it by
-                # this thread's OWN load (idle threads huddle on cpu0-1,
-                # busier ones spread over cpu0-5, only near-hot ones may use
-                # the coarse mask's big-core bits). fork-free via COLD_MASK.
-                cold_thread_mask "$4" "$coarse"
-                target=$COLD_MASK ;;
+                # v3.3: 小核均衡计划命中 -> 绑计划核 (模型分数前N, least-loaded)
+                if [ -n "$little_plan" ]; then
+                    local plan_mask=""
+                    plan_mask=$(printf '%b' "$little_plan" | awk -F'|' -v t="$tid2" '$1==t {print $2; exit}')
+                    if [ -n "$plan_mask" ]; then
+                        target=$plan_mask
+                    else
+                        # Unpinned thread: never the raw coarse mask - narrow it by
+                        # this thread's OWN load (idle threads huddle on cpu0-1,
+                        # busier ones spread over cpu0-5, only near-hot ones may use
+                        # the coarse mask's big-core bits). fork-free via COLD_MASK.
+                        cold_thread_mask "$4" "$coarse"
+                        target=$COLD_MASK
+                    fi
+                else
+                    cold_thread_mask "$4" "$coarse"
+                    target=$COLD_MASK
+                fi ;;
         esac
         applied=$8
         orig=$9

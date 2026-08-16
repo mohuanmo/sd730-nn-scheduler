@@ -5,7 +5,7 @@
 # ==================== 中文说明 ====================
 # 本脚本是 SD730 智能调度器的命令行控制工具, 支持:
 #   - 原有功能: 性能模式切换 / 状态查询 / 学习库 / 预测库 / 线程钉扎 / GPU 调度
-#   - 神经网络模型: 训练 / 推理 / 数据统计 / 开关控制 (线程级重排, 657 参数)
+#   - 神经网络模型: 训练 / 推理 / 数据统计 / 开关控制 (线程级重排, 737 参数)
 #
 # 模型训练命令速查 (详见 --help 底部 "MODEL TRAINING" 区块):
 #   神经网络模型 (线程级, 唯一模型; v3.2 已移除 V2 场景级模型):
@@ -114,7 +114,7 @@ show_help() {
     echo "MODEL TRAINING - 神经网络模型训练详细说明"
     echo "============================================================"
     echo ""
-    echo "[神经网络模型 (线程级重排, 657 参数)]"
+    echo "[神经网络模型 (线程级重排, 737 参数)]"
     echo "  模型文件: model/mlp_v3_enc.txt + model/mlp_v3_scr.txt (awk 可读)"
     echo "  训练数据: data/collector/*.traw, 需 >=300 条 (--nn-status 查看数量)"
     echo "  训练引擎: 有 numpy -> train_thread.py(快) / 无 numpy -> train_thread_pure.py(纯Python)"
@@ -323,8 +323,8 @@ show_nn_status() {
     echo ""
     echo "=== Model ==="
     if [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && [ -f "$MODDIR/model/mlp_v3_scr.txt" ]; then
-        echo "Model: EXISTS (encoder 25->10 + scorer 10+21->8->1, 657 params)"
-        echo "  encoder lines: $(wc -l < "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null) (expect 48)"
+        echo "Model: EXISTS (encoder 33->10 + scorer 10+21->8->1, 737 params)"
+        echo "  encoder lines: $(wc -l < "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null) (expect 56)"
         echo "  scorer lines:  $(wc -l < "$MODDIR/model/mlp_v3_scr.txt" 2>/dev/null) (expect 41)"
         echo "  last trained: $(stat -c %y "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null | cut -d. -f1)"
     else
@@ -389,9 +389,9 @@ nn_test() {
     fi
     local enc_lines=$(wc -l < "$enc" 2>/dev/null)
     local scr_lines=$(wc -l < "$scr" 2>/dev/null)
-    echo "[1] encoder: $enc_lines lines (expect 48 = 25W1+1b1+10Wk+1bk+10Ws+1bs)"
+    echo "[1] encoder: $enc_lines lines (expect 56 = 33W1+1b1+10Wk+1bk+10Ws+1bs)"
     echo "    scorer:  $scr_lines lines (expect 41 = 31W1+1b1+8W2+1b2)"
-    if [ "$enc_lines" -eq 48 ] 2>/dev/null && [ "$scr_lines" -eq 41 ] 2>/dev/null; then
+    if [ "$enc_lines" -eq 56 ] 2>/dev/null && [ "$scr_lines" -eq 41 ] 2>/dev/null; then
         echo "    ✓ layout OK"
     else
         echo "    ✗ layout wrong"

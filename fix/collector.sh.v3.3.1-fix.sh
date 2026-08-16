@@ -23,8 +23,6 @@ FRAME_STATS_OWNER="$DATA_DIR/.frame_stats_owner"  # v3.2 fix: 该帧统计属于
 FRAME_LOG_STAMP="$DATA_DIR/.frame_log_stamp"      # v3.2.2: 帧率失败日志节流时间戳
 CORE_LOAD="$DATA_DIR/.core_load"              # v3.3: 每核使用率% (c0|c1|...|c7)
 CORE_LOAD_PREV="$DATA_DIR/.core_load_prev"    # v3.3: /proc/stat 差分快照
-CPU_PREV="$DATA_DIR/.cpu_prev"                # v3.3.2 fix: cpu% 差分基准独立文件,
-                                              #   不再复用 .coll_state (避免 3/6 字段互相覆盖)
 
 # v3.2.2: 帧率失败日志节流 (30s 一条). 旧版每 5s 轮询失败打一条, 一天几千条刷屏
 frame_log() {
@@ -157,15 +155,12 @@ get_cpu_pct() {
     done
     local now=$(date +%s)
     local prev_pkg="" prev_j=0 prev_ts=0
-    # v3.3.2 fix: 差分基准独立存 .cpu_prev, .coll_state 由 write_coll_state 独占,
-    # 保持恒 6 字段 (旧实现 get_cpu_pct 每轮把 .coll_state 覆盖成 3 字段,
-    # 6 字段每轮只存在几毫秒, 推理端任意时刻读大概率拿到 3 字段 -> 特征丢失)
-    if [ -f "$CPU_PREV" ]; then
-        prev_pkg=$(cut -d'|' -f1 "$CPU_PREV" 2>/dev/null)
-        prev_j=$(cut -d'|' -f2 "$CPU_PREV" 2>/dev/null)
-        prev_ts=$(cut -d'|' -f3 "$CPU_PREV" 2>/dev/null)
+    if [ -f "$COLL_STATE" ]; then
+        prev_pkg=$(cut -d'|' -f1 "$COLL_STATE" 2>/dev/null)
+        prev_j=$(cut -d'|' -f2 "$COLL_STATE" 2>/dev/null)
+        prev_ts=$(cut -d'|' -f3 "$COLL_STATE" 2>/dev/null)
     fi
-    echo "${pkg}|${total_j}|${now}" > "${CPU_PREV}.tmp.$$" 2>/dev/null && mv "${CPU_PREV}.tmp.$$" "$CPU_PREV" 2>/dev/null
+    echo "${pkg}|${total_j}|${now}" > "${COLL_STATE}.tmp.$$" 2>/dev/null && mv "${COLL_STATE}.tmp.$$" "$COLL_STATE" 2>/dev/null
     case "$prev_j" in ''|*[!0-9]*) prev_j=0 ;; esac
     case "$prev_ts" in ''|*[!0-9]*) prev_ts=0 ;; esac
     local elapsed=$((now - prev_ts))
@@ -306,13 +301,8 @@ update_fg_duration() {
 #   原格式只有 pkg|jiffies|ts (前3列), nn_infer 曾把第3列(时间戳)误当 CPU 使用。
 #   get_cpu_pct 已把前3列更新为本轮值, 这里补上 threads/mem/cpu。
 write_coll_state() {
-    # v3.3.2 fix: 从 .cpu_prev 读差分基准 (旧实现从 .coll_state 读, 但 get_cpu_pct
-    # 已不再写 .coll_state, 直接读 .cpu_prev)
-    local _jiffies=0 _ts=0
-    if [ -f "$CPU_PREV" ]; then
-        _jiffies=$(cut -d'|' -f2 "$CPU_PREV" 2>/dev/null)
-        _ts=$(cut -d'|' -f3 "$CPU_PREV" 2>/dev/null)
-    fi
+    local _jiffies=$(cut -d'|' -f2 "$COLL_STATE" 2>/dev/null)
+    local _ts=$(cut -d'|' -f3 "$COLL_STATE" 2>/dev/null)
     case "$_jiffies" in ''|*[!0-9]*) _jiffies=0 ;; esac
     case "$_ts" in ''|*[!0-9]*) _ts=0 ;; esac
     echo "${pkg}|${_jiffies}|${_ts}|${threads}|${mem}|${cpu}" > "${COLL_STATE}.tmp.$$" 2>/dev/null \
@@ -406,9 +396,7 @@ $tname|$tid|$j"
             [ "$cpu_pct" -gt 100 ] && cpu_pct=100
             ttype=$(thread_type "$tn")
             thash=$(str_hash8 "$tn")
-            # v3.3.4 fix: 旧格式 "95/100" 被推理端 awk +0 解析成 95 (字符串数字前缀),
-            # 而训练端特征为 0.95 -> 训练/推理特征分布差 100 倍。改输出小数。
-            feat=$(awk "BEGIN{printf \"%.4f\", $cpu_pct/100}")
+            feat="$((cpu_pct))/100"
             c=0; i=0
             for c in 0 1 2 3 4 5 6 7 8 9 10 11; do
                 [ "$c" = "$ttype" ] && feat="$feat|1" || feat="$feat|0"
@@ -498,30 +486,26 @@ get_core_load() {
     local prev_ts=0
     [ -f "$CORE_LOAD_PREV" ] && prev_ts=$(head -1 "$CORE_LOAD_PREV" 2>/dev/null)
     case "$prev_ts" in ''|*[!0-9]*) prev_ts=0 ;; esac
-    local elapsed=0
-    [ "$prev_ts" -gt 0 ] 2>/dev/null && elapsed=$((now - prev_ts))
-    local out=""
-    # v3.3.2 fix: 先读旧快照差分, 再更新基准 (旧实现先覆盖 PREV 再差分 -> 恒 0);
-    # 且 awk 字段对齐: PREV 行 = cpuN|idle|total, /proc/stat 需自行取 idle/total
-    # (旧实现拿 PREV 的 idle 对比 /proc/stat 的 user/nice -> 全错)
-    if [ "$elapsed" -gt 0 ] && [ -f "$CORE_LOAD_PREV" ]; then
-        out=$(awk -v el="$elapsed" '
-            NR==FNR && /^cpu[0-7] / { pn[$1]=$2; pt[$1]=$3; next }
-            FNR>1 && /^cpu[0-7] / {
-                split($0,a," ")
-                idle=a[5]+a[6]; tot=a[2]+a[3]+a[4]+a[5]+a[6]+a[7]+a[8]
-                di=idle-pn[$1]; dt=tot-pt[$1]
-                u = (dt<=0) ? 0 : (dt-di)*100/dt
-                if (u<0) u=0; if (u>100) u=100
-                res = res sprintf("%s%.0f", (res?"|":""), u)
-            }
-            END { print res }' "$CORE_LOAD_PREV" /proc/stat 2>/dev/null)
-    fi
-    case "$out" in ''|*[!0-9|]*) out="0|0|0|0|0|0|0|0" ;; esac
-    echo "$out" > "${CORE_LOAD}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD}.tmp.$$" "$CORE_LOAD"
-    # 更新基准快照 (本轮 /proc/stat) 供下轮差分
+    # 存当前快照 (时间戳 + cpuN idle total)
     { echo "$now"; awk '/^cpu[0-7] / { split($0,a," "); idle=a[5]+a[6]; tot=0; for(i=2;i<=8;i++) tot+=a[i]; print a[1], idle, tot }' /proc/stat 2>/dev/null; } \
         > "${CORE_LOAD_PREV}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD_PREV}.tmp.$$" "$CORE_LOAD_PREV"
+    if [ "$prev_ts" -le 0 ] || [ $((now - prev_ts)) -le 0 ] 2>/dev/null; then
+        echo "0|0|0|0|0|0|0|0" > "${CORE_LOAD}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD}.tmp.$$" "$CORE_LOAD"
+        return 0
+    fi
+    local elapsed=$((now - prev_ts))
+    local out
+    out=$(awk -v prevfile="$CORE_LOAD_PREV" -v el="$elapsed" '
+        NR==FNR && /^cpu[0-7] / { pn[$1]=$2; pt[$1]=$3; next }
+        FNR>1 && /^cpu[0-7] / {
+            di=$2-pn[$1]; dt=$3-pt[$1]
+            u = (dt<=0) ? 0 : (dt-di)*100/dt
+            if (u<0) u=0; if (u>100) u=100
+            res = res sprintf("%s%.0f", (res?"|":""), u)
+        }
+        END { print res }' "$CORE_LOAD_PREV" /proc/stat 2>/dev/null)
+    case "$out" in ''|*[!0-9|]*) out="0|0|0|0|0|0|0|0" ;; esac
+    echo "$out" > "${CORE_LOAD}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD}.tmp.$$" "$CORE_LOAD"
 }
 
 while true; do
@@ -579,10 +563,7 @@ while true; do
             tstr=$(head -6 "$THREADS_SNAP" 2>/dev/null | awk -F'|' '{printf "%s|%s|", $1, $2}')
         fi
         # 补足 6 组 (空槽用 "none|0")
-        # v3.3.4 fix: tstr 以 | 结尾, awk NF 含末尾空字段 -> NF/2=4.5 小数
-        # -> [ 4.5 -lt 6 ] 整数比较失败 -> 永不补足 -> traw 缺线程槽位 -> 字段
-        # 错位 (核负载被当成线程名, 训练端 core 识别失败)。改数非空字段对。
-        tcount=$(printf '%s' "$tstr" | awk -F'|' '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print int(c/2)}')
+        tcount=$(echo "$tstr" | awk -F'|' '{print NF/2}')
         while [ "${tcount:-0}" -lt 6 ] 2>/dev/null; do tstr="${tstr}none|0|"; tcount=$((tcount + 1)); done
         # v3.3: traw 行尾追加 8 核负载 (训练端解析 parts[-8:], 旧数据无则置 0)
         core_str="0|0|0|0|0|0|0|0"

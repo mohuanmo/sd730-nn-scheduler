@@ -5,7 +5,8 @@ SD730 Neural Scheduler v3.0 - Thread-level Training, PURE PYTHON engine (v3.1.1)
 用于没有 numpy 的环境 (如 py2droid 精简构建 / 只能装 Python 3.14 的设备)。
 
 数据: data/collector/YYYYMMDD.traw
-  ts|pkg|聚合10|fn|favg|fvar|fzero|t1name|t1cpu|...|t6name|t6cpu
+  ts|pkg|聚合10|fn|favg|fvar|fzero|t1name|t1cpu|...|t6name|t6cpu|c0..c7(核负载%)
+  (v3.3: 行尾追加 8 个核负载, 旧数据无此字段则置 0)
 标签: 帧时间方差驱动 (帧率反馈)
   有效帧<10 或 0帧比例>30%      -> 跳过该样本 (帧率不可靠)
   帧时间 <= 1.05*16.67ms(60fps) -> 跑满, 标签 0 (已最优)
@@ -13,7 +14,8 @@ SD730 Neural Scheduler v3.0 - Thread-level Training, PURE PYTHON engine (v3.1.1)
   卡顿 (smooth<0.5)             -> 高负载线程标签高 (该绑)
   中间                           -> 线性过渡
 
-架构: 场景编码器(25->10) + 线程打分器(10+21->8->1), 联合训练
+架构: 场景编码器(33->10) + 线程打分器(10+21->8->1), 联合训练
+      (v3.3: 场景特征 25->33, 新增 8 维核负载分布, 让模型感知小核负载/空闲核)
 输出: model/mlp_v3_enc.txt + model/mlp_v3_scr.txt (awk 可读, 与 numpy 版一致)
 
 与 numpy 版的差异 (仅性能取舍, 数学一致):
@@ -110,8 +112,18 @@ def load_traw():
                             nm, cpu = parts[16+k*2], float(parts[17+k*2])
                             if nm and nm != "none":
                                 threads.append((nm, cpu))
+                        # v3.3: 行尾 8 个核负载字段 (旧数据没有则全 0)
+                        core = []
+                        if len(parts) >= 16 + 12 + 8:
+                            try:
+                                core = [float(x) for x in parts[-8:]]
+                            except ValueError:
+                                core = []
+                        if len(core) != 8:
+                            core = [0.0]*8
                         samples.append(dict(ts=ts, pkg=pkg, agg=agg, fn=fn,
-                                            favg=favg, fvar=fvar, fzero=fzero, threads=threads))
+                                            favg=favg, fvar=fvar, fzero=fzero,
+                                            threads=threads, core=core))
                     except (ValueError, IndexError):
                         continue
         except OSError:
@@ -168,8 +180,13 @@ def build_dataset(samples):
                 smooth_feat = 1.0
             else:
                 smooth_feat = max(0.0, 1.0 - s["fvar"] / 25.0)
+        core = s.get("core", [0.0]*8)
+        if len(core) != 8:
+            core = [0.0]*8
+        # v3.3: 加 8 维核负载 (c0..c7 使用率/100) -> 场景特征 11 -> 19, 总输入 25 -> 33
         sf = [agg[0]/100, agg[1]/100, agg[2]/100, agg[3]/100, agg[4], agg[5],
-              agg[6]/100, agg[7]/4096, agg[8]/24, min(agg[9],300)/300, smooth_feat]
+              agg[6]/100, agg[7]/4096, agg[8]/24, min(agg[9],300)/300, smooth_feat] + \
+             [c/100.0 for c in core]
         # 帧率标签 (场景级 -> 每线程)
         label_base = 0.0; skip = True
         if s["fn"] >= 10 and s["fzero"] <= 0.3 and s["favg"] > 0:
@@ -253,8 +270,8 @@ def bce_list(a, y):
 class Enc:
     def __init__(self, seed=42):
         r = random.Random(seed)
-        s25 = math.sqrt(2.0/25.0); s10 = math.sqrt(2.0/10.0)
-        self.W1 = [[r.gauss(0, 1)*s25 for _ in range(10)] for _ in range(25)]
+        s25 = math.sqrt(2.0/33.0); s10 = math.sqrt(2.0/10.0)
+        self.W1 = [[r.gauss(0, 1)*s25 for _ in range(10)] for _ in range(33)]
         self.b1 = [0.0]*10
         self.Wk = [[r.gauss(0, 1)*s10 for _ in range(2)] for _ in range(10)]
         self.bk = [0.0]*2
@@ -298,7 +315,7 @@ class Scr:
 # ============ 导出 (awk 可读, 与 numpy 版布局一致) ============
 def export_awk(enc, scr):
     with open(ENC_OUT, "w") as f:
-        for i in range(25):   # W1: 25 行
+        for i in range(33):   # W1: 33 行 (v3.3)
             f.write(" ".join(f"{enc.W1[i][j]:.6f}" for j in range(10)) + "\n")
         f.write(" ".join(f"{v:.6f}" for v in enc.b1) + "\n")
         for i in range(10):
@@ -344,7 +361,7 @@ def main():
     print("\n[2] Building dataset (frame-time labels)...")
     t0 = time.time()
     Xs, Xt, Yt, M = build_dataset(samples)
-    print(f"    Scenes: {len(Xs)}x25, Threads: {len(Xt)}x6x46 ({time.time()-t0:.1f}s)")
+    print(f"    Scenes: {len(Xs)}x33, Threads: {len(Xt)}x6x54 ({time.time()-t0:.1f}s)")   # v3.3: 33 维场景特征
     n_valid = sum(1 for s_ in M for m in s_ if m == 1)
     n_total = len(M) * 6
     print(f"    Valid thread labels (frame feedback ok): {n_valid}/{n_total} "
@@ -377,7 +394,7 @@ def main():
     Xt_tr = [th for s_ in Xt[:n_tr] for th in s_]
     Yt_tr = [y for s_ in Yt[:n_tr] for y in s_]     # 每个 y 是 [l] -> (6n,1)
     Mt_tr = [[m] for s_ in M[:n_tr] for m in s_]    # M 元素是 int -> (6n,1)
-    xt_tr = [row[25:46] for row in Xt_tr]          # (6n,21) 线程特征
+    xt_tr = [row[33:54] for row in Xt_tr]          # (6n,21) 线程特征 (v3.3: 场景段 33 维)
     n_6 = len(Xt_tr)                                # 6 * n_tr
     mt_sum_raw = sum(row[0] for row in Mt_tr)
     if mt_sum_raw == 0:
@@ -442,7 +459,7 @@ def main():
                 for j in range(10)] for i in range(n_tr)]
         # enc.W1 -= lr * (Xs_tr.T @ dhs)  (25,10)
         dW1e = matmul_At(Xs_tr, dhs)
-        for i in range(25):
+        for i in range(33):
             for j in range(10):
                 enc.W1[i][j] -= lr * dW1e[i][j]
         db1e = col_sum(dhs)
@@ -464,7 +481,7 @@ def main():
         dhs_kc = [[sum(dz_kc[i][k]*WkT[k][j] for k in range(2)) if h_sc[i][j] > 0.0 else 0.0
                    for j in range(10)] for i in range(n_tr)]
         dW1e2 = matmul_At(Xs_tr, dhs_kc)
-        for i in range(25):
+        for i in range(33):
             for j in range(10):
                 enc.W1[i][j] -= lr * dW1e2[i][j]
         db1e2 = col_sum(dhs_kc)
@@ -477,7 +494,7 @@ def main():
             kcv, sv, _ = enc.fwd(Xs_te)
             sv_r = [row for row in sv for _ in range(6)]
             Xt_te = [th for s_ in Xt[n_tr:] for th in s_]
-            xt_te = [row[25:46] for row in Xt_te]
+            xt_te = [row[33:54] for row in Xt_te]
             pv, _ = scr.fwd(sv_r, xt_te)
             Yt_te = [y for s_ in Yt[n_tr:] for y in s_]
             Mt_te = [m for s_ in M[n_tr:] for m in s_]

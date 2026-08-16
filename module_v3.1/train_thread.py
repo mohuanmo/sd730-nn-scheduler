@@ -11,7 +11,7 @@ SD730 Neural Scheduler v3.0 - Thread-level Training (frame-time feedback)
   卡顿 (smooth<0.5)             -> 高负载线程标签高 (该绑)
   中间                           -> 线性过渡
 
-架构: 场景编码器(24->10) + 线程打分器(10+21->8->1), 联合训练
+架构: 场景编码器(33->10) + 线程打分器(10+21->8->1), 联合训练 (v3.3: 场景特征 25->33, 加 8 维核负载)
 输出: model/mlp_v3_enc.txt + model/mlp_v3_scr.txt (awk 可读)
 """
 import os, glob, sys, time, random
@@ -104,8 +104,17 @@ def load_traw():
                             nm, cpu = parts[16+k*2], float(parts[17+k*2])
                             if nm and nm != "none":
                                 threads.append((nm, cpu))
+                        core = []
+                        if len(parts) >= 16 + 12 + 8:
+                            try:
+                                core = [float(x) for x in parts[-8:]]
+                            except ValueError:
+                                core = []
+                        if len(core) != 8:
+                            core = [0.0]*8
                         samples.append(dict(ts=ts, pkg=pkg, agg=agg, fn=fn,
-                                            favg=favg, fvar=fvar, fzero=fzero, threads=threads))
+                                            favg=favg, fvar=fvar, fzero=fzero,
+                                            threads=threads, core=core))
                     except (ValueError, IndexError):
                         continue
         except OSError:
@@ -163,8 +172,13 @@ def build_dataset(samples):
                 smooth_feat = 1.0                       # 跑满: 流畅
             else:
                 smooth_feat = max(0.0, 1.0 - s["fvar"] / 25.0)
+        core = s.get("core", [0.0]*8)
+        if len(core) != 8:
+            core = [0.0]*8
+        # v3.3: 加 8 维核负载 -> 场景特征 25 -> 33
         sf = [agg[0]/100, agg[1]/100, agg[2]/100, agg[3]/100, agg[4], agg[5],
-              agg[6]/100, agg[7]/4096, agg[8]/24, min(agg[9],300)/300, smooth_feat]
+              agg[6]/100, agg[7]/4096, agg[8]/24, min(agg[9],300)/300, smooth_feat] + \
+             [c/100.0 for c in core]
         # 帧率标签 (场景级 -> 每线程)
         label_base = 0.0; skip = True
         if s["fn"] >= 10 and s["fzero"] <= 0.3 and s["favg"] > 0:
@@ -202,7 +216,7 @@ def build_dataset(samples):
 class Enc:
     def __init__(self, seed=42):
         np.random.seed(seed)
-        self.W1 = np.random.randn(25,10).astype(np.float32)*np.sqrt(2/25)
+        self.W1 = np.random.randn(33,10).astype(np.float32)*np.sqrt(2/33)
         self.b1 = np.zeros(10, np.float32)
         self.Wk = np.random.randn(10,2).astype(np.float32)*np.sqrt(2/10)
         self.bk = np.zeros(2, np.float32)
@@ -233,7 +247,7 @@ def bce(a, y):
 # ============ 导出 (awk 可读, 与 nn_infer_v3.sh 布局一致) ============
 def export_awk(enc, scr):
     with open(ENC_OUT, "w") as f:
-        for i in range(25):   # W1: 25 行 (v3.1 加 smooth 特征)
+        for i in range(33):   # W1: 33 行 (v3.3 加 8 维核负载)
             f.write(" ".join(f"{float(enc.W1[i,j]):.6f}" for j in range(10)) + "\n")
         f.write(" ".join(f"{float(v):.6f}" for v in enc.b1) + "\n")
         for i in range(10):
@@ -278,10 +292,16 @@ def main():
 
     print("\n[2] Building dataset (frame-time labels)...")
     Xs, Xt, Yt, M = build_dataset(samples)
-    print(f"    Scenes: {Xs.shape} (25=24+smooth), Threads: {Xt.shape}")
+    print(f"    Scenes: {Xs.shape} (33=24+smooth+8core), Threads: {Xt.shape}")
     n_valid = int(M.sum())
     print(f"    Valid thread labels (frame feedback ok): {n_valid}/{M.size} "
           f"({n_valid/M.size*100:.0f}%)")
+    # v3.2 fix: 0 条有效帧率反馈 -> 模型无标签可学, 禁止导出
+    if n_valid == 0:
+        print("  [FATAL] 0 条有效帧率反馈样本, 模型无可学习标签, 不导出模型!")
+        print("          这是采集端问题: .frame_stats 未成功写入 / traw 第 13-16 列全为 0|0|0|1")
+        print("          排查: tail -20 /data/local/tmp/sd730-collector.log; cat $MODDIR/data/collector/.frame_stats")
+        sys.exit(2)
 
     # 划分 (按场景)
     n_tr = int(len(Xs)*0.85)
@@ -295,11 +315,14 @@ def main():
         kc, s, h_sc = enc.fwd(Xs[:n_tr])
         Xt_tr = Xt[:n_tr].reshape(-1, 46); Yt_tr = Yt[:n_tr].reshape(-1, 1)
         Mt_tr = M[:n_tr].reshape(-1, 1)
+        if Mt_tr.sum() == 0:
+            print("  [FATAL] 训练集 0 条有效帧率反馈样本 (有效样本全在验证集), 不导出模型!")
+            sys.exit(2)
         st_tr = np.repeat(s, 6, axis=0)
-        pt, h = scr.fwd(st_tr, Xt_tr[:, 25:46])
+        pt, h = scr.fwd(st_tr, Xt_tr[:, 33:54])   # v3.3: 场景段 33 维, 线程特征 21 维
         # 仅有效帧率样本参与损失
         dz = (pt - Yt_tr) * Mt_tr / max(1, Mt_tr.sum())
-        xin = np.concatenate([st_tr, Xt_tr[:, 25:46]], axis=1)
+        xin = np.concatenate([st_tr, Xt_tr[:, 33:54]], axis=1)
         scr.W2 -= lr*(h.T@dz); scr.b2 -= lr*dz.sum(0)
         dh = dz @ scr.W2.T * (h > 0)
         scr.W1 -= lr*(xin.T@dh); scr.b1 -= lr*dh.sum(0)
@@ -317,9 +340,12 @@ def main():
             sv_r = np.repeat(sv, 6, axis=0)
             Xt_v = Xt[n_tr:].reshape(-1, 46); Yt_v = Yt[n_tr:].reshape(-1, 1)
             Mt_v = M[n_tr:].reshape(-1, 1)
-            pv, _ = scr.fwd(sv_r, Xt_v[:, 25:46])
-            loss = bce(pv[Mt_v.flatten()==1], Yt_v[Mt_v.flatten()==1]) if Mt_v.sum() > 0 else 0
-            print(f"  Epoch {e:3d}: thread-val-loss={loss:.4f}")
+            pv, _ = scr.fwd(sv_r, Xt_v[:, 33:54])
+            if Mt_v.sum() > 0:
+                loss = bce(pv[Mt_v.flatten()==1], Yt_v[Mt_v.flatten()==1])
+                print(f"  Epoch {e:3d}: thread-val-loss={loss:.4f}")
+            else:
+                print(f"  Epoch {e:3d}: thread-val-loss=  (no valid val samples)")
 
     print("\n[4] Exporting awk models...")
     export_awk(enc, scr)

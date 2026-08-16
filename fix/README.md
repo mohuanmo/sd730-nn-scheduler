@@ -1,4 +1,50 @@
-# v3.2 / v3.2.2 修复: 训练 loss 恒为 0.0000 / 有效标签 0% 的问题
+# v3.2 / v3.2.2 / v3.3 修复与验证
+
+## 〇、v3.3.4 全链路端到端测试（2026-08-16，`fix/test_full_pipeline.sh`）
+
+**链路**: 采集(collector) → 数据落盘(traw) → 训练(pure-python) → 模型导出(enc/scr)
+         → 推理打分(nn_infer_v3) → tid 决策(v3_decision) → 绑核掩码(apply_app_affinity_smart)
+
+**结果**: 35/35 通过（v3.3.4 发布物，mock dumpsys + 真实 /proc 进程模拟前台 app）
+
+**本次测试暴露并修复的采集端 bug（全部打进 v3.3.4 包）**:
+
+| # | 现象 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | `.core_load` 恒 0，核负载特征从未进模型 | `get_core_load` 先覆盖 PREV 再差分（自己对比自己）；且 awk 拿 PREV 的 idle/total 对比 /proc/stat 的 user/nice（字段错位） | 先读旧快照差分、后更新基准；awk 按 /proc/stat 真实字段取 idle/total |
+| 2 | `.coll_state` 间歇 3 字段，推理端 cpu/threads/mem 特征丢失 | `get_cpu_pct` 每轮把 .coll_state 覆盖成 3 字段（差分基准存这里），6 字段每轮只存在几毫秒 | 差分基准独立存 `.cpu_prev`，.coll_state 由 write_coll_state 独占，恒 6 字段 |
+| 3 | traw 只有 32 字段，线程槽位缺 none 补足 → 核负载被解析成线程名、core 特征全 0 | 补足循环 `tcount=NF/2` 遇末尾 `\|` 得 4.5 小数，`[ 4.5 -lt 6 ]` 整数比较失败 → 永不补足 | 改数非空字段对（`int(c/2)`），补足恒到 6 组 |
+| 4 | 训练/推理线程特征差 100 倍 | 快照特征写 `"95/100"`，推理端 awk `+0` 按数字前缀解析成 95，训练端用 0.95 | 采集端改输出小数 `0.9500` |
+
+**测试环境注意**: 沙箱无 `/system/bin/sh`，v3_decision.sh 直接执行 nn_infer_v3.sh（shebang）
+会失败 → 测试脚本创建 /system/bin/sh 符号链接；bash read 不截断 cmdline 的 NUL → 模拟 app
+用单 argv C 程序（cmdline 恰为 `com.test.game\0`）。
+
+## 〇、v3.3 完整验证结论（2026-08-16）
+
+4 层验证全部通过（脚本已存 fix/）：
+
+| 层 | 脚本 | 结果 |
+|---|---|---|
+| ① 模块结构 | （zip 检查） | 28 文件齐全、28 脚本语法全过、customize.sh 权限齐全 |
+| ② 服务加载 | `fix/test_source_smoke.sh` | functions.sh source 成功（105 函数）、tpin_load_conf 配置/默认值全对 |
+| ③ 决策核心 | `fix/test_tpin_nn_logic.sh` | 模型解析/eff 权重/escalate 模型门/小核 least-loaded 全对 |
+| ④ 端到端 | `fix/test_v33_e2e.sh` | **14/14 通过**（真实 functions.sh + 真实进程 + mock 环境） |
+
+端到端关键证据（模型权重式干扰真实生效）：
+- 4 线程模拟（3 热 + 1 空闲），真实 busy 进程 + prctl 改 comm
+- bind_log：`main(score 0.619)→c0 大核`、`RenderThread(负载80但score 0.484)→被挤到小核`、
+  空闲线程 → least-loaded 绑单小核（8/20/10）
+- **不是纯负载排序**：负载最高的 RenderThread 因模型分数低被挤出大核 —— 模型确实在干扰分配
+- 大核名额 escalate 2→3 生效（3 热线程 + 卡顿 + 模型认可）
+- 模型缺失 → 自动回退纯规则（legacy 绑定仍工作）
+
+⚠️ 验证中发现的严重问题（已修复）：
+1. **v3.3 包最初打的是残缺版 functions.sh**（A/B/D/E/H 五段修改因脚本 assert 失败丢失，
+   只写入了 C/F/G）。已用完整版重新打包，包内 md5 与源码一致。
+2. e2e 中 `grep -c` 无匹配时退出码 1，`|| echo 0` 产生 `0\n0` 导致断言误报（测试脚本已修）。
+
+---
 
 ## 〇、v3.2.2 追加修复（刷 v3.2.2 包的用户看这里）
 

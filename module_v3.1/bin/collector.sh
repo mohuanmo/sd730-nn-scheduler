@@ -19,6 +19,23 @@ FG_DUR_FILE="$DATA_DIR/.fg_duration"
 FG_START_FILE="$DATA_DIR/.fg_start"
 THREADS_SNAP="$DATA_DIR/.threads_snapshot"   # v3.0: 线程快照 (name|cpu|21维特征)
 FRAME_STATS="$DATA_DIR/.frame_stats"         # v3.0: 帧率反馈 (帧数|平均帧时间|方差|0帧比例)
+FRAME_STATS_OWNER="$DATA_DIR/.frame_stats_owner"  # v3.2 fix: 该帧统计属于哪个前台 app (防跨 app 复用脏数据)
+FRAME_LOG_STAMP="$DATA_DIR/.frame_log_stamp"      # v3.2.2: 帧率失败日志节流时间戳
+CORE_LOAD="$DATA_DIR/.core_load"              # v3.3: 每核使用率% (c0|c1|...|c7)
+CORE_LOAD_PREV="$DATA_DIR/.core_load_prev"    # v3.3: /proc/stat 差分快照
+CPU_PREV="$DATA_DIR/.cpu_prev"                # v3.3.2 fix: cpu% 差分基准独立文件,
+                                              #   不再复用 .coll_state (避免 3/6 字段互相覆盖)
+
+# v3.2.2: 帧率失败日志节流 (30s 一条). 旧版每 5s 轮询失败打一条, 一天几千条刷屏
+frame_log() {
+    local now=$(date +%s) last=0
+    [ -f "$FRAME_LOG_STAMP" ] && last=$(cat "$FRAME_LOG_STAMP" 2>/dev/null)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $((now - last)) -ge 30 ] 2>/dev/null; then
+        echo "$now" > "${FRAME_LOG_STAMP}.tmp.$$" 2>/dev/null && mv "${FRAME_LOG_STAMP}.tmp.$$" "$FRAME_LOG_STAMP" 2>/dev/null
+        log_msg "$1"
+    fi
+}
 V3_LAST=0                                     # v3.0: 上次线程/帧率采样时间
 
 # 采集数据保留天数 (v2.1.6): 统一从 nn.conf 读取 nn_data_keep_days, 默认 5 天
@@ -140,12 +157,15 @@ get_cpu_pct() {
     done
     local now=$(date +%s)
     local prev_pkg="" prev_j=0 prev_ts=0
-    if [ -f "$COLL_STATE" ]; then
-        prev_pkg=$(cut -d'|' -f1 "$COLL_STATE" 2>/dev/null)
-        prev_j=$(cut -d'|' -f2 "$COLL_STATE" 2>/dev/null)
-        prev_ts=$(cut -d'|' -f3 "$COLL_STATE" 2>/dev/null)
+    # v3.3.2 fix: 差分基准独立存 .cpu_prev, .coll_state 由 write_coll_state 独占,
+    # 保持恒 6 字段 (旧实现 get_cpu_pct 每轮把 .coll_state 覆盖成 3 字段,
+    # 6 字段每轮只存在几毫秒, 推理端任意时刻读大概率拿到 3 字段 -> 特征丢失)
+    if [ -f "$CPU_PREV" ]; then
+        prev_pkg=$(cut -d'|' -f1 "$CPU_PREV" 2>/dev/null)
+        prev_j=$(cut -d'|' -f2 "$CPU_PREV" 2>/dev/null)
+        prev_ts=$(cut -d'|' -f3 "$CPU_PREV" 2>/dev/null)
     fi
-    echo "${pkg}|${total_j}|${now}" > "${COLL_STATE}.tmp.$$" 2>/dev/null && mv "${COLL_STATE}.tmp.$$" "$COLL_STATE" 2>/dev/null
+    echo "${pkg}|${total_j}|${now}" > "${CPU_PREV}.tmp.$$" 2>/dev/null && mv "${CPU_PREV}.tmp.$$" "$CPU_PREV" 2>/dev/null
     case "$prev_j" in ''|*[!0-9]*) prev_j=0 ;; esac
     case "$prev_ts" in ''|*[!0-9]*) prev_ts=0 ;; esac
     local elapsed=$((now - prev_ts))
@@ -286,8 +306,13 @@ update_fg_duration() {
 #   原格式只有 pkg|jiffies|ts (前3列), nn_infer 曾把第3列(时间戳)误当 CPU 使用。
 #   get_cpu_pct 已把前3列更新为本轮值, 这里补上 threads/mem/cpu。
 write_coll_state() {
-    local _jiffies=$(cut -d'|' -f2 "$COLL_STATE" 2>/dev/null)
-    local _ts=$(cut -d'|' -f3 "$COLL_STATE" 2>/dev/null)
+    # v3.3.2 fix: 从 .cpu_prev 读差分基准 (旧实现从 .coll_state 读, 但 get_cpu_pct
+    # 已不再写 .coll_state, 直接读 .cpu_prev)
+    local _jiffies=0 _ts=0
+    if [ -f "$CPU_PREV" ]; then
+        _jiffies=$(cut -d'|' -f2 "$CPU_PREV" 2>/dev/null)
+        _ts=$(cut -d'|' -f3 "$CPU_PREV" 2>/dev/null)
+    fi
     case "$_jiffies" in ''|*[!0-9]*) _jiffies=0 ;; esac
     case "$_ts" in ''|*[!0-9]*) _ts=0 ;; esac
     echo "${pkg}|${_jiffies}|${_ts}|${threads}|${mem}|${cpu}" > "${COLL_STATE}.tmp.$$" 2>/dev/null \
@@ -334,8 +359,10 @@ write_threads_snapshot() {
     local pkg="$1"
     [ -z "$pkg" ] && return
     local now=$(date +%s)
-    local prev_ts=0 prev_data=""
-    [ -f "$THREADS_PREV" ] && prev_ts=$(cut -d'|' -f1 "$THREADS_PREV" 2>/dev/null)
+    local prev_ts=0
+    # v3.3.1 fix: cut 会对 PREV 每一行取字段 -> 多行输出 -> prev_ts 含换行
+    # -> [ -gt ] 整数比较失败 -> 快照永不写入。必须 head -1 只取时间戳。
+    [ -f "$THREADS_PREV" ] && prev_ts=$(head -1 "$THREADS_PREV" 2>/dev/null)
     local lines=""
     local pid t tid tname j
     for pid in $(get_pids "$pkg"); do
@@ -352,27 +379,37 @@ write_threads_snapshot() {
 $tname|$tid|$j"
         done
     done
-    # 保存本轮快照供下轮差分化
-    echo "$now" > "${THREADS_PREV}.tmp.$$" 2>/dev/null
-    echo "$lines" | tail -n +2 >> "${THREADS_PREV}.tmp.$$"
-    mv "${THREADS_PREV}.tmp.$$" "$THREADS_PREV"
+    # v3.3.1 fix: 差分需要上一轮 jiffies, 必须在覆盖 PREV 前读取
+    old_prev=""
+    if [ -f "$THREADS_PREV" ]; then
+        old_prev=$(tail -n +2 "$THREADS_PREV" 2>/dev/null)
+    fi
+    # 保存本轮快照 (时间戳 + 每行 name|tid|jiffies)
+    { echo "$now"; echo "$lines" | tail -n +2; } > "${THREADS_PREV}.tmp.$$" 2>/dev/null \
+        && mv "${THREADS_PREV}.tmp.$$" "$THREADS_PREV"
     # 与上轮差分计算 cpu%, 取 top-6
     local out=""
     if [ -n "$prev_ts" ] && [ "$prev_ts" -gt 0 ] 2>/dev/null; then
         local elapsed=$((now - prev_ts))
         [ "$elapsed" -le 0 ] && elapsed=1
-        # prev_data 从 .threads_prev 的旧值读 (简化: 用 jiffies 差)
-        local prev_jiff=""
-        prev_jiff=$(sed -n '2p' "$THREADS_PREV" 2>/dev/null | cut -d'|' -f3)
+        # v3.3.1 fix: 管道 while 是子 shell (非函数), mksh 下 local 报错导致循环体
+        # 不执行 -> out 恒空 -> .threads_snapshot 永不写入。全部去掉 local。
+        # 同时修 cpu 差分: 旧版 (tj-0)/elapsed 用累计 jiffies 会高估到 100。
         out=$(echo "$lines" | tail -n +2 | while IFS='|' read -r tn tid tj; do
             case "$tj" in ''|*[!0-9]*) tj=0 ;; esac
-            local cpu_pct=$(( (tj - 0) / elapsed ))   # 简化: 忽略跨行 prev 匹配
-            [ "$cpu_pct" -lt 0 ] && cpu_pct=0
+            prev_j=0
+            prev_j=$(printf '%s\n' "$old_prev" | awk -F'|' -v t="$tid" '$2==t {print $3; exit}')
+            case "$prev_j" in ''|*[!0-9]*) prev_j=0 ;; esac
+            delta=$((tj - prev_j))
+            [ "$delta" -lt 0 ] && delta=0
+            cpu_pct=$(( delta / elapsed ))
             [ "$cpu_pct" -gt 100 ] && cpu_pct=100
-            local ttype=$(thread_type "$tn")
-            local thash=$(str_hash8 "$tn")
-            local feat="$((cpu_pct))/100"
-            local c i=0
+            ttype=$(thread_type "$tn")
+            thash=$(str_hash8 "$tn")
+            # v3.3.4 fix: 旧格式 "95/100" 被推理端 awk +0 解析成 95 (字符串数字前缀),
+            # 而训练端特征为 0.95 -> 训练/推理特征分布差 100 倍。改输出小数。
+            feat=$(awk "BEGIN{printf \"%.4f\", $cpu_pct/100}")
+            c=0; i=0
             for c in 0 1 2 3 4 5 6 7 8 9 10 11; do
                 [ "$c" = "$ttype" ] && feat="$feat|1" || feat="$feat|0"
             done
@@ -386,36 +423,105 @@ $tname|$tid|$j"
 }
 
 # ============ v3.0: 帧率反馈采集 (帧时间方差) ============
+# v3.2 fix: 帧率反馈采集失败 -> .traw 里 fn=0/fzero=1 默认值 -> 训练端 0% 有效标签
+#   (表现为 loss 恒 0.0000, 模型是随机初始化导出, 等于没训)
+# v3.2.2 fix: 3 个后续问题
+#   1) 失败日志每 5s 刷一条 -> frame_log() 30s 节流
+#   2) 视频场景 (bilibilihd 播放中) 也报 "帧数不足" -> 旧逻辑取"第一个 ≥10 帧"的候选 layer,
+#      会选到 UI/弹幕层(帧少)而非视频渲染层 -> 改为遍历所有候选, 选"有效帧数最多"的 layer
+#   3) 微信等报 "no layer matching" -> dumpsys SurfaceFlinger --list 在 SF 忙时 5s 被掐断,
+#      只输出前半段(系统层), 后半段 app 层没打出来 -> --list 超时放宽到 10s
 # 输出: 有效帧数|平均帧时间ms|方差ms²|0帧比例  (写入 .frame_stats)
 # 规则: 有效帧<10 或 0帧比例>30% 时训练端跳过帧率反馈
 get_frame_stats() {
     local pkg="$1"
-    local layer
-    layer=$(dumpsys_t SurfaceFlinger --list | grep -i "${pkg%.*}" | head -1)
-    [ -z "$layer" ] && return 1
-    local raw
-    raw=$(dumpsys_t SurfaceFlinger --latency "$layer" | tail -n +4 | head -128)
-    [ -z "$raw" ] && return 1
-    echo "$raw" | awk '
-    BEGIN { n=0; prev=0; sum=0; sum2=0; zeros=0; total=0 }
-    {
-        total++
-        actual=$2 + 0
-        if (actual <= 0) { zeros++; next }
-        if (prev > 0) {
-            dt = actual - prev
-            if (dt > 0 && dt < 1000000000) {   # 排除异常间隔 (>1s)
-                n++; sum += dt; sum2 += dt*dt
+    [ -z "$pkg" ] && return 1
+    # 前台 app 切换 -> 旧帧统计作废
+    local owner=""
+    [ -f "$FRAME_STATS_OWNER" ] && owner=$(cat "$FRAME_STATS_OWNER" 2>/dev/null)
+    if [ "$owner" != "$pkg" ]; then
+        rm -f "$FRAME_STATS" 2>/dev/null
+        echo "$pkg" > "${FRAME_STATS_OWNER}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS_OWNER}.tmp.$$" "$FRAME_STATS_OWNER" 2>/dev/null
+    fi
+    local list layer raw candidates
+    # v3.2.2: --list 超时 5s -> 10s (SF 忙时输出几千行会被 5s 掐断, 造成假阴性 "no layer matching")
+    if command -v timeout >/dev/null 2>&1; then
+        list=$(timeout 10 dumpsys SurfaceFlinger --list 2>/dev/null)
+    else
+        list=$(dumpsys SurfaceFlinger --list 2>/dev/null)
+    fi
+    [ -z "$list" ] && { frame_log "[frame] SurfaceFlinger --list empty/timeout for $pkg"; return 1; }
+    # 候选1: 完整包名固定串匹配, 优先带 # 的 layer (真实渲染 surface)
+    candidates=$(echo "$list" | grep -iF "$pkg" | grep -F '#')
+    # 候选2: 完整包名匹配任意 layer
+    [ -z "$candidates" ] && candidates=$(echo "$list" | grep -iF "$pkg" | head -8)
+    # 候选3: 包名去掉最后一段 (兼容 layer 名省略 activity 后缀)
+    [ -z "$candidates" ] && candidates=$(echo "$list" | grep -iF "${pkg%.*}" | head -8)
+    [ -z "$candidates" ] && { frame_log "[frame] no layer matching $pkg"; return 1; }
+    # v3.2.2: 遍历所有候选, 选"有效帧数最多"的 layer
+    local n best_n=0 best_raw="" best_layer=""
+    for layer in $candidates; do
+        [ -n "$layer" ] || continue
+        # 只取 3 列纯数字行 (层名/刷新周期/表头自动跳过), 最多 128 行
+        raw=$(dumpsys_t SurfaceFlinger --latency "$layer" 2>/dev/null | \
+              awk 'NF==3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {print; if (++c>=128) exit}')
+        [ -z "$raw" ] && continue
+        n=$(echo "$raw" | awk '{a=$2+0; if(a>0) c++} END {print c+0}')
+        if [ "${n:-0}" -gt "$best_n" ] 2>/dev/null; then
+            best_n=$n; best_raw=$raw; best_layer=$layer
+        fi
+    done
+    if [ "${best_n:-0}" -ge 10 ] 2>/dev/null && [ -n "$best_raw" ]; then
+        echo "$best_raw" | awk '
+            BEGIN { n=0; prev=0; sum=0; sum2=0; zeros=0; total=0 }
+            { total++; actual=$2+0
+              if (actual <= 0) { zeros++; next }
+              if (prev > 0) { dt=actual-prev; if (dt>0 && dt<1000000000) { n++; sum+=dt; sum2+=dt*dt } }
+              prev=actual }
+            END { if (total==0) { print "0|0|0|1"; exit }
+                  if (n<10) { printf "%d|0|0|%.2f\n", n, zeros/total; exit }
+                  avg=sum/n; var=sum2/n-avg*avg; if (var<0) var=0
+                  printf "%d|%.2f|%.2f|%.2f\n", n, avg/1000000, var/1e12, zeros/total }' \
+            > "${FRAME_STATS}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS}.tmp.$$" "$FRAME_STATS"
+        return 0
+    fi
+    frame_log "[frame] no layer with >=10 valid frames for $pkg (best=$best_n)"
+    return 1
+}
+
+# ============ v3.3: 每核使用率采集 (供模型感知小核负载分布/均衡) ============
+# 输出: c0|c1|...|c7 (使用率%, 0-100), 写入 .core_load
+# 基于 /proc/stat cpuN 行的 (total-idle)/total 差分; 首轮无差分输出 0
+get_core_load() {
+    local now
+    now=$(date +%s)
+    local prev_ts=0
+    [ -f "$CORE_LOAD_PREV" ] && prev_ts=$(head -1 "$CORE_LOAD_PREV" 2>/dev/null)
+    case "$prev_ts" in ''|*[!0-9]*) prev_ts=0 ;; esac
+    local elapsed=0
+    [ "$prev_ts" -gt 0 ] 2>/dev/null && elapsed=$((now - prev_ts))
+    local out=""
+    # v3.3.2 fix: 先读旧快照差分, 再更新基准 (旧实现先覆盖 PREV 再差分 -> 恒 0);
+    # 且 awk 字段对齐: PREV 行 = cpuN|idle|total, /proc/stat 需自行取 idle/total
+    # (旧实现拿 PREV 的 idle 对比 /proc/stat 的 user/nice -> 全错)
+    if [ "$elapsed" -gt 0 ] && [ -f "$CORE_LOAD_PREV" ]; then
+        out=$(awk -v el="$elapsed" '
+            NR==FNR && /^cpu[0-7] / { pn[$1]=$2; pt[$1]=$3; next }
+            FNR>1 && /^cpu[0-7] / {
+                split($0,a," ")
+                idle=a[5]+a[6]; tot=a[2]+a[3]+a[4]+a[5]+a[6]+a[7]+a[8]
+                di=idle-pn[$1]; dt=tot-pt[$1]
+                u = (dt<=0) ? 0 : (dt-di)*100/dt
+                if (u<0) u=0; if (u>100) u=100
+                res = res sprintf("%s%.0f", (res?"|":""), u)
             }
-        }
-        prev = actual
-    }
-    END {
-        if (total == 0) { print "0|0|0|1"; exit }
-        if (n < 10) { printf "%d|0|0|%.2f\n", n, zeros/total; exit }
-        avg = sum/n; var = sum2/n - avg*avg
-        printf "%d|%.2f|%.2f|%.2f\n", n, avg/1000000, var/1e12, zeros/total
-    }' > "${FRAME_STATS}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS}.tmp.$$" "$FRAME_STATS"
+            END { print res }' "$CORE_LOAD_PREV" /proc/stat 2>/dev/null)
+    fi
+    case "$out" in ''|*[!0-9|]*) out="0|0|0|0|0|0|0|0" ;; esac
+    echo "$out" > "${CORE_LOAD}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD}.tmp.$$" "$CORE_LOAD"
+    # 更新基准快照 (本轮 /proc/stat) 供下轮差分
+    { echo "$now"; awk '/^cpu[0-7] / { split($0,a," "); idle=a[5]+a[6]; tot=0; for(i=2;i<=8;i++) tot+=a[i]; print a[1], idle, tot }' /proc/stat 2>/dev/null; } \
+        > "${CORE_LOAD_PREV}.tmp.$$" 2>/dev/null && mv "${CORE_LOAD_PREV}.tmp.$$" "$CORE_LOAD_PREV"
 }
 
 while true; do
@@ -447,16 +553,24 @@ while true; do
         V3_LAST=$ts
         write_threads_snapshot "$pkg"
         get_frame_stats "$pkg"
+        get_core_load
         # 追加历史记录到 YYYYMMDD.traw (供 train_thread.py 训练)
         # 格式: ts|pkg|聚合10|fn|favg|fvar|fzero|t1name|t1cpu|...|t6name|t6cpu
         traw="$DATA_DIR/$(date +%Y%m%d).traw"
+        # v3.2 fix: 只有帧统计属于当前 app 且 <30s 新鲜才采用, 否则用默认值
+        # (旧实现: 换 app 后仍复用上个 app 的 .frame_stats -> 用错的帧反馈标错标签)
         fn=0 favg=0 fvar=0 fzero=1
         if [ -f "$FRAME_STATS" ]; then
-            IFS='|' read -r fn favg fvar fzero < "$FRAME_STATS" 2>/dev/null
-            case "$fn" in ''|*[!0-9]*) fn=0 ;; esac
-            case "$favg" in ''|*[!0-9.]*) favg=0 ;; esac
-            case "$fvar" in ''|*[!0-9.]*) fvar=0 ;; esac
-            case "$fzero" in ''|*[!0-9.]*) fzero=1 ;; esac
+            fs_age=$(( $(date +%s) - $(stat -c %Y "$FRAME_STATS" 2>/dev/null || echo 0) ))
+            fs_owner=""
+            [ -f "$FRAME_STATS_OWNER" ] && fs_owner=$(cat "$FRAME_STATS_OWNER" 2>/dev/null)
+            if [ "$fs_owner" = "$pkg" ] && [ "$fs_age" -le 30 ] 2>/dev/null; then
+                IFS='|' read -r fn favg fvar fzero < "$FRAME_STATS" 2>/dev/null
+                case "$fn" in ''|*[!0-9]*) fn=0 ;; esac
+                case "$favg" in ''|*[!0-9.]*) favg=0 ;; esac
+                case "$fvar" in ''|*[!0-9.]*) fvar=0 ;; esac
+                case "$fzero" in ''|*[!0-9.]*) fzero=1 ;; esac
+            fi
         fi
         # 从快照取最多 6 线程
         tline="$traw_line"
@@ -465,9 +579,18 @@ while true; do
             tstr=$(head -6 "$THREADS_SNAP" 2>/dev/null | awk -F'|' '{printf "%s|%s|", $1, $2}')
         fi
         # 补足 6 组 (空槽用 "none|0")
-        tcount=$(echo "$tstr" | awk -F'|' '{print NF/2}')
+        # v3.3.4 fix: tstr 以 | 结尾, awk NF 含末尾空字段 -> NF/2=4.5 小数
+        # -> [ 4.5 -lt 6 ] 整数比较失败 -> 永不补足 -> traw 缺线程槽位 -> 字段
+        # 错位 (核负载被当成线程名, 训练端 core 识别失败)。改数非空字段对。
+        tcount=$(printf '%s' "$tstr" | awk -F'|' '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print int(c/2)}')
         while [ "${tcount:-0}" -lt 6 ] 2>/dev/null; do tstr="${tstr}none|0|"; tcount=$((tcount + 1)); done
-        echo "${ts}|${pkg}|${cpu}|${gpu}|${temp}|${batt}|${chg}|${screen}|${threads}|${mem}|${hour}|${fgdur}|${fn}|${favg}|${fvar}|${fzero}|${tstr}" >> "$traw" 2>/dev/null
+        # v3.3: traw 行尾追加 8 核负载 (训练端解析 parts[-8:], 旧数据无则置 0)
+        core_str="0|0|0|0|0|0|0|0"
+        if [ -f "$CORE_LOAD" ]; then
+            core_str=$(cat "$CORE_LOAD" 2>/dev/null)
+            case "$core_str" in ''|*[!0-9|]*) core_str="0|0|0|0|0|0|0|0" ;; esac
+        fi
+        echo "${ts}|${pkg}|${cpu}|${gpu}|${temp}|${batt}|${chg}|${screen}|${threads}|${mem}|${hour}|${fgdur}|${fn}|${favg}|${fvar}|${fzero}|${tstr}${core_str}" >> "$traw" 2>/dev/null
     fi
 
     # v3.1 fix: 进度心跳。watchdog 用 .hb_done 判断采集器是否"活着但卡死"

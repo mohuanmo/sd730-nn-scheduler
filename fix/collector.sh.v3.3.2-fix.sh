@@ -406,9 +406,7 @@ $tname|$tid|$j"
             [ "$cpu_pct" -gt 100 ] && cpu_pct=100
             ttype=$(thread_type "$tn")
             thash=$(str_hash8 "$tn")
-            # v3.3.4 fix: 旧格式 "95/100" 被推理端 awk +0 解析成 95 (字符串数字前缀),
-            # 而训练端特征为 0.95 -> 训练/推理特征分布差 100 倍。改输出小数。
-            feat=$(awk "BEGIN{printf \"%.4f\", $cpu_pct/100}")
+            feat="$((cpu_pct))/100"
             c=0; i=0
             for c in 0 1 2 3 4 5 6 7 8 9 10 11; do
                 [ "$c" = "$ttype" ] && feat="$feat|1" || feat="$feat|0"
@@ -579,10 +577,7 @@ while true; do
             tstr=$(head -6 "$THREADS_SNAP" 2>/dev/null | awk -F'|' '{printf "%s|%s|", $1, $2}')
         fi
         # 补足 6 组 (空槽用 "none|0")
-        # v3.3.4 fix: tstr 以 | 结尾, awk NF 含末尾空字段 -> NF/2=4.5 小数
-        # -> [ 4.5 -lt 6 ] 整数比较失败 -> 永不补足 -> traw 缺线程槽位 -> 字段
-        # 错位 (核负载被当成线程名, 训练端 core 识别失败)。改数非空字段对。
-        tcount=$(printf '%s' "$tstr" | awk -F'|' '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print int(c/2)}')
+        tcount=$(echo "$tstr" | awk -F'|' '{print NF/2}')
         while [ "${tcount:-0}" -lt 6 ] 2>/dev/null; do tstr="${tstr}none|0|"; tcount=$((tcount + 1)); done
         # v3.3: traw 行尾追加 8 核负载 (训练端解析 parts[-8:], 旧数据无则置 0)
         core_str="0|0|0|0|0|0|0|0"
