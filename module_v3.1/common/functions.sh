@@ -557,16 +557,29 @@ get_temperature() {
         echo $((max_temp / 1000))
         return
     fi
-    # Pass 2 (fallback): max of all zones (original behavior)
+    # Pass 2 (fallback, v3.1.1): 只统计真正的温度传感器 (类型过滤 + 范围过滤),
+    # 避免把 lmh-dcvs/ibat/vbat/bcl/soc/step/lowf 等非温度节点误判成高温
     for zone in $THERMAL_ZONE/thermal_zone*/temp; do
-        if [ -f "$zone" ]; then
-            temp=$(cat "$zone" 2>/dev/null)
-            if [ -n "$temp" ] && [ "$temp" -gt "$max_temp" ] 2>/dev/null; then
-                max_temp=$temp
-            fi
+        [ -f "$zone" ] || continue
+        type=$(cat "${zone%/temp}/type" 2>/dev/null)
+        case "$type" in
+            *-tz|*-usr|*therm*|battery|bms) ;;
+            *) continue ;;
+        esac
+        temp=$(cat "$zone" 2>/dev/null)
+        case "$temp" in ''|*[!0-9]*) continue ;; esac
+        [ "$temp" -le 0 ] && continue
+        c=0
+        if [ "$temp" -ge 10000 ] && [ "$temp" -le 150000 ]; then
+            c=$((temp / 1000))
+        elif [ "$temp" -ge 100 ] && [ "$temp" -le 1500 ]; then
+            c=$(( (temp + 5) / 10 ))
+        elif [ "$temp" -ge 10 ] && [ "$temp" -le 150 ]; then
+            c=$temp
         fi
+        [ "$c" -ge 10 ] && [ "$c" -le 90 ] && [ "$c" -gt "$max_temp" ] && max_temp=$c
     done
-    echo $((max_temp / 1000))
+    echo "$max_temp"
 }
 
 # Get battery level (0-100)

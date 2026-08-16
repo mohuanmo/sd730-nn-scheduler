@@ -27,14 +27,31 @@ MODEL="/data/adb/modules/sd730-scheduler/model/mlp_weights.txt"
 [ -f "$MODEL" ] || { echo "1.0 1.0"; exit 0; }
 
 # ---- Read system state ----
+# v3.1.1: 只统计真正的温度传感器 (-tz/-usr/含therm/battery/bms),
+# 过滤 lmh-dcvs/ibat/vbat/bcl/soc/step/lowf; 单位归一化 + [10,90]°C 过滤。
+# 旧实现全 zone 取最大/1000 会把 lmh-dcvs 的 75000 误采成 75°C, 污染推理特征。
 MAX_TEMP=0
 for zone in /sys/class/thermal/thermal_zone*/temp; do
     [ -f "$zone" ] || continue
+    TYPE=$(cat "${zone%/temp}/type" 2>/dev/null)
+    case "$TYPE" in
+        *-tz|*-usr|*therm*|battery|bms) ;;
+        *) continue ;;
+    esac
     T=$(cat "$zone" 2>/dev/null)
     case "$T" in ''|*[!0-9]*) continue ;; esac
-    [ "$T" -gt "$MAX_TEMP" ] && MAX_TEMP=$T
+    [ "$T" -le 0 ] && continue
+    C=0
+    if [ "$T" -ge 10000 ] && [ "$T" -le 150000 ]; then
+        C=$((T / 1000))                     # 毫摄氏度: 48000 -> 48
+    elif [ "$T" -ge 100 ] && [ "$T" -le 1500 ]; then
+        C=$(( (T + 5) / 10 ))               # 十分之一度: 480 -> 48
+    elif [ "$T" -ge 10 ] && [ "$T" -le 150 ]; then
+        C=$T                                # 摄氏度
+    fi
+    [ "$C" -ge 10 ] && [ "$C" -le 90 ] && [ "$C" -gt "$MAX_TEMP" ] && MAX_TEMP=$C
 done
-TEMP=$((MAX_TEMP / 1000))
+TEMP=$MAX_TEMP
 [ "$TEMP" -gt 100 ] && TEMP=100
 [ "$TEMP" -lt 0 ] && TEMP=0
 

@@ -1,86 +1,138 @@
 #!/system/bin/sh
 ################################################################################
-# SD730 Smart Scheduler - CLI Control Tool v1.5.4-nn (Neural Scheduler v2.1.4)
+# SD730 Smart Scheduler - CLI Control Tool (Neural Scheduler v3.2)
+#
+# ==================== 中文说明 ====================
+# 本脚本是 SD730 智能调度器的命令行控制工具, 支持:
+#   - 原有功能: 性能模式切换 / 状态查询 / 学习库 / 预测库 / 线程钉扎 / GPU 调度
+#   - 神经网络模型: 训练 / 推理 / 数据统计 / 开关控制 (线程级重排, 657 参数)
+#
+# 模型训练命令速查 (详见 --help 底部 "MODEL TRAINING" 区块):
+#   神经网络模型 (线程级, 唯一模型; v3.2 已移除 V2 场景级模型):
+#     自动训练   sd730-scheduler --nn-train       (默认开启自动训练, 窗口内自动跑)
+#     强制训练   sd730-scheduler --nn-train-now   (跳过样本量门槛)
+#     启用/禁用  sd730-scheduler --nn-v3-enable / --nn-v3-disable (默认启用)
+# =================================================
 ################################################################################
 
 MODDIR="/data/adb/modules/sd730-scheduler"
 . $MODDIR/common/functions.sh
 
 show_help() {
-    echo "SD730 Smart Scheduler v1.5.4-nn (NN v2.1.4)"
+    echo "SD730 Smart Scheduler (Neural Scheduler v3.2)"
     echo ""
     echo "Usage: sd730-scheduler [OPTION]"
+    echo "       用法: sd730-scheduler [选项]"
     echo ""
     echo "Options:"
     echo "  --mode <powersave|balanced|performance|ultra>"
     echo "      Switch to specified performance mode"
+    echo "      切换性能模式 (省电/均衡/性能/极限)"
     echo "  --status"
     echo "      Show current status and statistics"
+    echo "      查看当前状态与统计"
     echo "  --stats"
     echo "      Show learning database statistics"
+    echo "      查看学习库统计"
     echo "  --prediction-stats"
     echo "      Show prediction database statistics"
+    echo "      查看预测库统计"
     echo "  --reset-learning"
     echo "      Reset the learning database"
+    echo "      重置学习库"
     echo "  --reset-prediction"
     echo "      Reset the prediction database"
+    echo "      重置预测库"
     echo "  --mode-learning-stats"
     echo "      Show learned per-app mode preferences (from manual switches)"
+    echo "      查看已学习的每应用模式偏好 (来自手动切换记录)"
     echo "  --reset-mode-learning"
     echo "      Reset the mode learning database"
+    echo "      重置模式学习库"
     echo "  --prediction-enable"
     echo "      Enable the prediction engine"
+    echo "      启用预测引擎"
     echo "  --prediction-disable"
     echo "      Disable the prediction engine"
+    echo "      禁用预测引擎"
     echo "  --daemon"
     echo "      Run as background daemon"
+    echo "      以后台守护方式运行 (预测学习循环)"
     echo "  --affinity <package>"
     echo "      Show recommended CPU affinity for an app"
+    echo "      查看某应用推荐的 CPU 亲和掩码"
     echo "  --threads [package]"
     echo "      Live per-thread CPU% and affinity mask of an app (default: foreground)"
+    echo "      实时查看某应用各线程 CPU% 与亲和掩码 (默认前台应用)"
     echo "  --gpu-status"
     echo "      GPU adaptive scheduler: lock/tier state, live nodes, watchdog health"
+    echo "      GPU 自适应调度状态: 锁定/分级/实时节点/看门狗健康"
     echo "  --tpin-status"
     echo "      Thread Pin Engine status: pinned threads, elastic budget, learned names"
+    echo "      线程钉扎引擎状态: 已钉线程/弹性预算/已学习线程名"
     echo "  --tpin-reset"
     echo "      Release all thread pins immediately (restores original masks)"
+    echo "      立即释放全部线程钉扎 (恢复原始掩码)"
     echo "  --tpin-enable / --tpin-disable"
     echo "      Toggle the Thread Pin Engine (config/thread_pin.conf)"
+    echo "      开关线程钉扎引擎 (config/thread_pin.conf)"
     echo "  --selfm-reset"
     echo "      Reset self-management verdicts (apps re-observed from scratch)"
+    echo "      重置自管理判定 (应用重新从头观察)"
     echo "  --scene <mode>"
     echo "      Set mode via Scene integration"
+    echo "      通过 Scene 集成设置性能模式"
     echo "  --nn-status"
-    echo "      Neural Scheduler: model / data / alpha / last inference"
+    echo "      Neural Network model: model / data / auto-train / live thread scores"
+    echo "      神经网络模型状态: 模型/训练数据/自动训练/实时线程分数"
     echo "  --nn-train"
     echo "      Manually trigger model training (auto numpy|pure-python engine)"
-    echo "  --nn-train-now [--v3]"
-    echo "      FORCE training now: skips standby/data gates (temp: 85C hard ceiling)"
-    echo "      --v3 -> force train thread-level v3 model (train_thread.py, needs numpy)"
-    echo "  --nn-infer"
-    echo "      Run one inference (prints: k cap_ratio)"
+    echo "      手动触发模型训练 (自动选 numpy/纯Python 引擎)"
+    echo "  --nn-train-now"
+    echo "      FORCE training now: skips data gate (temp: 85C hard ceiling)"
+    echo "      强制立即训练: 跳过样本量门槛 (温度绝对上限 85C)"
     echo "  --nn-test"
     echo "      Model integrity + inference sanity test"
+    echo "      模型完整性 + 推理测试"
     echo "  --nn-data"
-    echo "      Data collector stats (rows, days, size, retention)"
-    echo "  --nn-alpha <0.0-1.0>"
-    echo "      Set NN mixing ratio (0=rule-only, 1=NN-only, suggest <=0.5)"
+    echo "      Training data stats (traw rows, days, size, collector state)"
+    echo "      训练数据统计 (traw 行数/天数/大小/采集器状态)"
     echo "  --nn-enable / --nn-disable"
-    echo "      Toggle the Neural Scheduler"
-    echo "  --nn-warmup-test"
-    echo "      Show foreground warmup detection state"
-    echo "  --nn-v3-status"
-    echo "      v3 thread-level model: config / model / live thread scores"
-    echo "  --nn-thread-test"
-    echo "      Run v3 inference on current state, show per-thread pin scores"
+    echo "      Toggle the Neural Scheduler (master switch)"
+    echo "      启用/禁用神经调度器 (总开关)"
     echo "  --nn-v3-enable / --nn-v3-disable"
-    echo "      Toggle v3 model-score thread reordering (config/v3.conf)"
+    echo "      Toggle Neural Network model reordering (config/v3.conf)"
+    echo "      启用/禁用神经网络模型线程重排 (config/v3.conf)"
+    echo "  --nn-v3-status"
+    echo "      Alias of --nn-status (compat)"
+    echo "      --nn-status 的兼容别名"
     echo "  --help"
     echo "      Show this help message"
+    echo "      显示本帮助"
+    echo ""
+    echo "============================================================"
+    echo "MODEL TRAINING - 神经网络模型训练详细说明"
+    echo "============================================================"
+    echo ""
+    echo "[神经网络模型 (线程级重排, 657 参数)]"
+    echo "  模型文件: model/mlp_v3_enc.txt + model/mlp_v3_scr.txt (awk 可读)"
+    echo "  训练数据: data/collector/*.traw, 需 >=300 条 (--nn-status 查看数量)"
+    echo "  训练引擎: 有 numpy -> train_thread.py(快) / 无 numpy -> train_thread_pure.py(纯Python)"
+    echo "  自动训练: 默认开启 (config/v3.conf v3_auto_train=true, 窗口内自动训)"
+    echo "  手动训练: sd730-scheduler --nn-train (自动) / --nn-train-now (强制)"
+    echo "  启用模型: 默认开启 (config/v3.conf v3_enabled=true)"
+    echo "            --nn-v3-enable 开启 / --nn-v3-disable 关闭"
+    echo ""
+    echo "[验证是否生效]"
+    echo "  sd730-scheduler --nn-status -> Model: EXISTS 且 model reorder: true"
+    echo "  运行日志: grep NN /data/local/tmp/sd730-scheduler.log"
+    echo "  自动训练日志: cat /data/local/tmp/sd730-nn-auto-train.log"
     echo ""
     echo "Scene Integration:"
     echo "  Write mode to: /data/adb/modules/sd730-scheduler/config/scene_mode"
+    echo "  写入模式到: /data/adb/modules/sd730-scheduler/config/scene_mode"
     echo "  Values: auto, powersave, balanced, performance, ultra"
+    echo "  取值: auto(自动), powersave(省电), balanced(均衡), performance(性能), ultra(极限)"
     echo ""
 }
 
@@ -253,64 +305,67 @@ nn_cfg() {
 
 show_nn_status() {
     local nn_enabled=$(nn_cfg nn_enabled "true")
-    local nn_alpha=$(nn_cfg nn_alpha "0.0")
     local nn_temp_limit=$(nn_cfg nn_temp_limit "70")
     local keep_days=$(nn_cfg nn_data_keep_days "3")
-    echo "=== Neural Scheduler Status ==="
-    echo "Enabled: $nn_enabled"
-    echo "Alpha (NN mix ratio): $nn_alpha   (0=rule-only)"
+    local v3_on="false" v3_auto="true"
+    if [ -f "$MODDIR/config/v3.conf" ]; then
+        v3_on=$(grep '^v3_enabled=' "$MODDIR/config/v3.conf" 2>/dev/null | cut -d= -f2-)
+        v3_auto=$(grep '^v3_auto_train=' "$MODDIR/config/v3.conf" 2>/dev/null | cut -d= -f2-)
+    fi
+    [ "$v3_on" != "true" ] && v3_on="false"
+    [ "$v3_auto" != "false" ] && v3_auto="true"
+    echo "=== Neural Network Model Status (神经网络模型状态) ==="
+    echo "Enabled: $nn_enabled (总开关) | model reorder: $v3_on (config/v3.conf)"
+    echo "Auto-train: $v3_auto (config/v3.conf, 训练窗口内自动训练)"
+    echo "Train window: $(nn_cfg nn_train_start_hour 1):00-$(nn_cfg nn_train_end_hour 4):00, max temp $(nn_cfg nn_train_max_temp 55)C"
     echo "Temperature limit: ${nn_temp_limit}C (above -> force rule-only)"
     echo "Data retention: ${keep_days} days (collector auto-rotates)"
-    echo "Train gate: deep-standby(charging+off+noFG), max temp $(nn_cfg nn_train_max_temp 55)C; --nn-train-now 强制: 跳过待机/样本门槛, 温度绝对上限 85C"
     echo ""
     echo "=== Model ==="
-    if [ -f "$MODDIR/model/mlp_weights.txt" ]; then
-        local hdr=$(head -1 "$MODDIR/model/mlp_weights.txt" 2>/dev/null)
-        local mtime=$(stat -c %y "$MODDIR/model/mlp_weights.txt" 2>/dev/null | cut -d. -f1)
-        echo "Model: EXISTS (architecture: $hdr)"
-        echo "Last trained: $mtime"
+    if [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && [ -f "$MODDIR/model/mlp_v3_scr.txt" ]; then
+        echo "Model: EXISTS (encoder 25->10 + scorer 10+21->8->1, 657 params)"
+        echo "  encoder lines: $(wc -l < "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null) (expect 48)"
+        echo "  scorer lines:  $(wc -l < "$MODDIR/model/mlp_v3_scr.txt" 2>/dev/null) (expect 41)"
+        echo "  last trained: $(stat -c %y "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null | cut -d. -f1)"
     else
-        echo "Model: MISSING (train with: sd730-scheduler --nn-train)"
+        echo "Model: MISSING (train with: sd730-scheduler --nn-train-now)"
     fi
     echo ""
-    echo "=== Training Data ==="
-    local total_rows=0 n_files=0 oldest="-" newest="-"
-    for f in "$MODDIR"/data/collector/*.raw; do
+    echo "=== Training Data (.traw) ==="
+    local n_traw=0 rows=0
+    for f in "$MODDIR"/data/collector/*.traw; do
         [ -f "$f" ] || continue
-        n_files=$((n_files + 1))
-        local rows=$(wc -l < "$f" 2>/dev/null)
-        case "$rows" in ''|*[!0-9]*) rows=0 ;; esac
-        total_rows=$((total_rows + rows))
-        local d=$(basename "$f" .raw)
-        [ "$oldest" = "-" ] && oldest=$d
-        newest=$d
+        n_traw=$((n_traw + 1))
+        local r=$(wc -l < "$f" 2>/dev/null)
+        case "$r" in ''|*[!0-9]*) r=0 ;; esac
+        rows=$((rows + r))
     done
-    echo "Data files: $n_files (dates $oldest .. $newest)"
-    echo "Total samples: $total_rows (need >=500 to train)"
-    if [ "$total_rows" -ge 500 ] 2>/dev/null; then
+    echo "traw files: $n_traw, total rows: $rows (need >=300 to train)"
+    if [ "$rows" -ge 300 ] 2>/dev/null; then
         echo "Training readiness: READY"
     else
         echo "Training readiness: not enough data yet"
     fi
-    echo ""
-    echo "=== Live Inference ==="
-    if [ -f "$MODDIR/bin/nn_infer.sh" ]; then
-        local out=$(sh "$MODDIR/bin/nn_infer.sh" 2>/dev/null)
-        [ -n "$out" ] && echo "nn_infer.sh -> $out  (k cap_ratio)" || echo "nn_infer.sh -> (no output)"
+    if [ -f "$MODDIR/data/collector/.frame_stats" ]; then
+        echo "last frame stats: $(cat "$MODDIR/data/collector/.frame_stats") (frames|avg_ms|var|zero_ratio)"
     else
-        echo "nn_infer.sh missing"
+        echo "frame stats: not available (collector v3 sampling?)"
+    fi
+    echo ""
+    echo "=== Live Thread Scores ==="
+    if [ -f "$MODDIR/model/mlp_v3_enc.txt" ]; then
+        sh "$MODDIR/bin/v3_decision.sh" 2>/dev/null | head -8
+    else
+        echo "(model missing - no thread scoring)"
     fi
 }
 
 nn_train() {
     if [ -f "$MODDIR/bin/train.sh" ]; then
-        echo "[+] Triggering training (auto numpy|pure-python engine)..."
+        echo "[+] Triggering model training (auto numpy|pure-python engine)..."
         sh "$MODDIR/bin/train.sh"
-    elif [ -f "$MODDIR/train_pure.py" ] && command -v python3 >/dev/null 2>&1; then
-        echo "[+] Fallback: pure-python engine directly"
-        python3 -u "$MODDIR/train_pure.py"
     else
-        echo "[-] train.sh not found and no python3. Nothing to do."
+        echo "[-] train.sh not found"
         return 1
     fi
 }
@@ -325,53 +380,39 @@ nn_infer() {
 }
 
 nn_test() {
-    echo "=== NN Model Test ==="
-    local model="$MODDIR/model/mlp_weights.txt"
-    if [ ! -f "$model" ]; then
-        echo "[-] FAIL: model missing at $model"
-        echo "    Run: sd730-scheduler --nn-train"
+    echo "=== Neural Network Model Test (模型测试) ==="
+    local enc="$MODDIR/model/mlp_v3_enc.txt" scr="$MODDIR/model/mlp_v3_scr.txt"
+    if [ ! -f "$enc" ] || [ ! -f "$scr" ]; then
+        echo "[-] FAIL: model missing ($enc / $scr)"
+        echo "    Run: sd730-scheduler --nn-train-now"
         return 1
     fi
-    local hdr=$(head -1 "$model" 2>/dev/null)
-    echo "[1] Model file: $model"
-    echo "    Header: $hdr (expect: 10 16 2)"
-    case "$hdr" in
-        "10 16 2") echo "    ✓ architecture OK" ;;
-        *) echo "    ✗ unexpected header"; return 1 ;;
-    esac
-    local lines=$(wc -l < "$model" 2>/dev/null)
-    echo "    Lines: $lines (expect 29 = 1+10+1+16+1)"
-    [ "$lines" -eq 29 ] 2>/dev/null && echo "    ✓ layout OK" || echo "    ✗ layout wrong"
-    echo "[2] Live inference:"
-    if [ -f "$MODDIR/bin/nn_infer.sh" ]; then
-        local out=$(sh "$MODDIR/bin/nn_infer.sh" 2>/dev/null)
-        local k=$(echo "$out" | awk '{print $1}')
-        local cap=$(echo "$out" | awk '{print $2}')
-        case "$k" in ''|*[!0-9.]*) k=0 ;; esac
-        case "$cap" in ''|*[!0-9.]*) cap=0 ;; esac
-        local k_ok=$(awk "BEGIN {print ($k >= 0.5 && $k <= 2.0) ? 1 : 0}" 2>/dev/null)
-        local c_ok=$(awk "BEGIN {print ($cap >= 0.5 && $cap <= 1.5) ? 1 : 0}" 2>/dev/null)
-        echo "    output: $out"
-        [ "$k_ok" = "1" ] && echo "    ✓ k in [0.5, 2.0]" || echo "    ✗ k out of range"
-        [ "$c_ok" = "1" ] && echo "    ✓ cap in [0.5, 1.5]" || echo "    ✗ cap out of range"
-        if [ "$k_ok" = "1" ] && [ "$c_ok" = "1" ]; then
-            echo ""
-            echo "✓✓✓ MODEL TEST PASSED - inference pipeline healthy"
-        else
-            echo ""
-            echo "✗ MODEL TEST FAILED - retrain with: sd730-scheduler --nn-train"
-            return 1
-        fi
+    local enc_lines=$(wc -l < "$enc" 2>/dev/null)
+    local scr_lines=$(wc -l < "$scr" 2>/dev/null)
+    echo "[1] encoder: $enc_lines lines (expect 48 = 25W1+1b1+10Wk+1bk+10Ws+1bs)"
+    echo "    scorer:  $scr_lines lines (expect 41 = 31W1+1b1+8W2+1b2)"
+    if [ "$enc_lines" -eq 48 ] 2>/dev/null && [ "$scr_lines" -eq 41 ] 2>/dev/null; then
+        echo "    ✓ layout OK"
     else
-        echo "[-] nn_infer.sh missing"
+        echo "    ✗ layout wrong"
+        return 1
+    fi
+    echo "[2] Live thread scoring:"
+    local out=$(sh "$MODDIR/bin/v3_decision.sh" 2>/dev/null | head -5)
+    if [ -n "$out" ]; then
+        echo "$out"
+        echo ""
+        echo "✓✓✓ MODEL TEST PASSED - inference pipeline healthy"
+    else
+        echo "[-] v3_decision.sh produced no output"
         return 1
     fi
 }
 
 nn_data() {
-    echo "=== Collector Data ==="
+    echo "=== Training Data (.traw) ==="
     local total_rows=0 n_files=0 total_bytes=0
-    for f in "$MODDIR"/data/collector/*.raw; do
+    for f in "$MODDIR"/data/collector/*.traw; do
         [ -f "$f" ] || continue
         n_files=$((n_files + 1))
         local rows=$(wc -l < "$f" 2>/dev/null)
@@ -381,19 +422,25 @@ nn_data() {
         case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
         total_bytes=$((total_bytes + sz))
     done
-    echo "Data files: $n_files"
-    echo "Total rows: $total_rows"
+    echo "traw files: $n_files"
+    echo "Total rows: $total_rows (need >=300 to train)"
     echo "Total size: $((total_bytes / 1024)) KB"
     echo "Retention:  $(nn_cfg nn_data_keep_days 3) days"
     if [ -f "$MODDIR/data/collector/.coll_state" ]; then
         echo "State snapshot: $(cat "$MODDIR/data/collector/.coll_state" 2>/dev/null)"
     fi
     local coll_pid=""
-    coll_pid=$(pgrep -f "collector.sh" 2>/dev/null | head -1)
+    # v3.1 fix: 用完整路径模式, 避免把 ensure_collector.sh 自身误当采集器;
+    # 排除僵尸进程, 避免误报"RUNNING"导致用户以为没启动。
+    for p in $(pgrep -f "bin/collector.sh" 2>/dev/null); do
+        case "$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)" in Z*) continue ;; esac
+        coll_pid=$p
+        break
+    done
     if [ -n "$coll_pid" ]; then
         echo "Collector: RUNNING (pid $coll_pid)"
     else
-        echo "Collector: not running (start: sh $MODDIR/bin/collector.sh &)"
+        echo "Collector: not running (开机自动拉起: sh $MODDIR/bin/ensure_collector.sh; 手动: sh $MODDIR/bin/collector.sh &)"
     fi
 }
 
@@ -428,43 +475,8 @@ nn_toggle() {
 }
 
 nn_v3_status() {
-    echo "=== v3 Thread-Level Model Status ==="
-    local v3_on="false"
-    if [ -f "$MODDIR/config/v3.conf" ]; then
-        v3_on=$(grep '^v3_enabled=' "$MODDIR/config/v3.conf" 2>/dev/null | cut -d'=' -f2-)
-    fi
-    echo "v3 reorder: $v3_on (config/v3.conf)"
-    echo ""
-    echo "=== v3 Model ==="
-    if [ -f "$MODDIR/model/mlp_v3_enc.txt" ] && [ -f "$MODDIR/model/mlp_v3_scr.txt" ]; then
-        echo "Model: EXISTS"
-        echo "  encoder header: $(head -1 "$MODDIR/model/mlp_v3_enc.txt" | wc -w) cols x $(wc -l < "$MODDIR/model/mlp_v3_enc.txt") lines (expect 25x10 layout)"
-        echo "  scorer lines: $(wc -l < "$MODDIR/model/mlp_v3_scr.txt") (expect 41)"
-        echo "  last trained: $(stat -c %y "$MODDIR/model/mlp_v3_enc.txt" 2>/dev/null | cut -d. -f1)"
-    else
-        echo "Model: MISSING (train with: sd730-scheduler --nn-train-now --v3)"
-    fi
-    echo ""
-    echo "=== v3 Training Data ==="
-    local n_traw=0 rows=0
-    for f in "$MODDIR"/data/collector/*.traw; do
-        [ -f "$f" ] || continue
-        n_traw=$((n_traw + 1))
-        local r=$(wc -l < "$f" 2>/dev/null)
-        case "$r" in ''|*[!0-9]*) r=0 ;; esac
-        rows=$((rows + r))
-    done
-    echo "traw files: $n_traw, total rows: $rows (need >=300 to train)"
-    if [ -f "$MODDIR/data/collector/.frame_stats" ]; then
-        echo "last frame stats: $(cat "$MODDIR/data/collector/.frame_stats") (frames|avg_ms|var|zero_ratio)"
-    else
-        echo "frame stats: not available (collector v3 sampling?)"
-    fi
-    echo ""
-    echo "=== Live Thread Scores ==="
-    if [ -f "$MODDIR/model/mlp_v3_enc.txt" ]; then
-        sh "$MODDIR/bin/v3_decision.sh" 2>/dev/null | head -8
-    fi
+    # v3.2: --nn-v3-status 为 --nn-status 的兼容别名, 统一显示"神经网络模型"
+    show_nn_status
 }
 
 nn_thread_test() {
@@ -484,7 +496,7 @@ nn_v3_toggle() {
     local val="$1"
     if [ -f "$MODDIR/config/v3.conf" ]; then
         sed -i "s/^v3_enabled=.*/v3_enabled=$val/" "$MODDIR/config/v3.conf"
-        echo "[+] v3 thread reordering $([ "$val" = "true" ] && echo enabled || echo disabled)."
+        echo "[+] Neural Network model $([ "$val" = "true" ] && echo enabled || echo disabled)."
     else
         echo "[-] v3.conf not found"
         return 1
@@ -520,6 +532,8 @@ case "$1" in
                 echo "$2" > "$CONFIG_DIR/current_mode"
                 echo "[+] Mode switched to: $2"
                 apply_mode "$2" "" "force"
+                # 记录前台应用的手动切换偏好, 并清除之前自动学习的模式:
+                # 用户的手动选择永远优先于自动学习结果。
                 # Learn this MANUAL switch for the foreground app, and clear
                 # any auto-applied learned mode: the user's hand always wins.
                 fg_app=$(get_foreground_app)
@@ -562,6 +576,8 @@ case "$1" in
         echo "[+] Prediction engine disabled."
         ;;
     --daemon)
+        # 子 shell 必须自行 source functions.sh: shell 函数不会被子进程
+        # "sh -c" 继承, 旧版单行写法会一直报 "run_learning_cycle: not found" 空转。
         # The child shell must source functions.sh itself: shell functions are
         # not inherited by "sh -c", so the old one-liner just spun forever on
         # "run_learning_cycle: not found".
@@ -614,21 +630,17 @@ case "$1" in
         nn_train
         ;;
     --nn-train-now)
-        # 主动判断后立即强制训练 (v3.1.1): 跳过 待机/样本量 门槛; 温度仅保留 85°C 绝对上限
+        # 强制立即训练神经网络模型 (v3.2): 跳过样本量门槛; 温度仅保留 85°C 绝对上限
         if [ -f "$MODDIR/bin/train.sh" ]; then
-            if [ "$2" = "--v3" ]; then
-                echo "[+] FORCE v3 training now (train_thread.py --force)..."
-                sh "$MODDIR/bin/train.sh" --force --v3
-            else
-                echo "[+] FORCE training now (skips standby/data gates)..."
-                sh "$MODDIR/bin/train.sh" --force
-            fi
+            echo "[+] FORCE training now (skips data gate)..."
+            sh "$MODDIR/bin/train.sh" --force
         else
             echo "[-] train.sh not found"
         fi
         ;;
     --nn-infer)
-        nn_infer
+        # v3.2 兼容: V2 k/cap 推理已随 V2 模型移除, 保留命令避免旧脚本报错
+        echo "[-] --nn-infer 已移除 (v3.2): V2 k/cap 模型已废弃; 线程分数用 --nn-status 查看"
         ;;
     --nn-test)
         nn_test
@@ -637,11 +649,8 @@ case "$1" in
         nn_data
         ;;
     --nn-alpha)
-        if [ -z "$2" ]; then
-            echo "Error: No alpha specified (0.0 - 1.0)"
-            exit 1
-        fi
-        nn_set_alpha "$2"
+        # v3.2 兼容: V2 场景级模型已移除, alpha 不再参与调度; 保留命令避免旧脚本报错
+        echo "[-] --nn-alpha 已移除 (v3.2): V2 场景级模型已废弃, 神经网络模型无需混合系数"
         ;;
     --nn-enable)
         nn_toggle true

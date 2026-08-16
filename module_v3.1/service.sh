@@ -42,11 +42,72 @@ sleep 15
 ) &
 
 NN_WD=0              # NN v3.1: collector 守护计数器
+AUTO_CHK=0           # NN v3.1.1: 自动训练检查计数器 (每 300 轮 x 3s = 15 分钟)
+AUTO_TRAIN_LOG="/data/local/tmp/sd730-nn-auto-train.log"
 PREV_APP=""
 PREV2_APP=""          # app before PREV_APP: second-order prediction context
 PREDICTED_APP=""
 SCENE_PREV=""
 SCENE_HOLD_UNTIL=0
+
+# 自动训练日志滚动 (v3.1.1): 超 256KB 保留末 200 行, 与 functions.sh log_msg 一致
+rotate_auto_log() {
+    local size=$(wc -c < "$AUTO_TRAIN_LOG" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    if [ "$size" -gt 262144 ] 2>/dev/null; then
+        tail -n 200 "$AUTO_TRAIN_LOG" > "$AUTO_TRAIN_LOG.tmp" 2>/dev/null && mv "$AUTO_TRAIN_LOG.tmp" "$AUTO_TRAIN_LOG" 2>/dev/null
+    fi
+}
+
+# ==================== NN 自动训练 (v3.2) ====================
+# 神经网络(线程级)模型默认开启自动训练 (config/v3.conf v3_auto_train=true)。
+# 触发条件 (每天最多一次, 在训练窗口内):
+#   - 窗口: nn_train_start_hour:00 ~ nn_train_end_hour:00 (默认 1:00-4:00)
+#   - 当天未训练 (状态文件 data/collector/.auto_train)
+#   - 样本门槛交给训练脚本自身把关 (train_thread*.py, >=300)
+#   - 训练成功才写状态文件; 失败当天窗口内会重试
+# 训练在后台子 shell 运行, 不阻塞主循环; 输出追加到 $AUTO_TRAIN_LOG
+# v3.2 变更: 移除 V2 自动训练 (nn_auto_train), 仅保留神经网络模型自动训练
+nn_auto_train_check() {
+    local today hour shour ehour inw auto3
+    today=$(date +%Y%m%d)
+    hour=$(date +%H)
+    rotate_auto_log   # 滚动检查 (每次检查触发前) (v3.1.1)
+    shour=$(grep '^nn_train_start_hour=' "$NN_CONF" 2>/dev/null | cut -d= -f2-)
+    case "$shour" in ''|*[!0-9]*) shour=1 ;; esac
+    ehour=$(grep '^nn_train_end_hour=' "$NN_CONF" 2>/dev/null | cut -d= -f2-)
+    case "$ehour" in ''|*[!0-9]*) ehour=4 ;; esac
+    # 神经网络模型自动训练开关 (默认 true)
+    auto3=$(grep '^v3_auto_train=' "$MODDIR/config/v3.conf" 2>/dev/null | cut -d= -f2-)
+    [ "$auto3" != "false" ] && auto3="true"
+
+    # 窗口判断 (支持跨天, 如 23:00-04:00)
+    inw=0
+    if [ "$shour" -le "$ehour" ]; then
+        [ "$hour" -ge "$shour" ] && [ "$hour" -lt "$ehour" ] && inw=1
+    else
+        { [ "$hour" -ge "$shour" ] || [ "$hour" -lt "$ehour" ]; } && inw=1
+    fi
+    [ "$inw" = "0" ] && return
+
+    # 防重入: 已有训练在跑则跳过 (pgrep 不会匹配到自身)
+    pgrep -f "train_thread" >/dev/null 2>&1 && return
+
+    if [ "$auto3" = "true" ] && [ ! -f "$NN_DATA_DIR/.auto_train" ]; then
+        log_msg "[NN] Auto-train triggered (window ${shour}:00-${ehour}:00)"
+        (
+            echo "===== AUTO-TRAIN $(date '+%F %T') =====" >> "$AUTO_TRAIN_LOG"
+            sh "$MODDIR/bin/train.sh" >> "$AUTO_TRAIN_LOG" 2>&1
+            if [ $? -eq 0 ]; then
+                echo "$today" > "$NN_DATA_DIR/.auto_train" 2>/dev/null
+                echo "[AUTO-TRAIN] ok, done for today" >> "$AUTO_TRAIN_LOG"
+            else
+                echo "[AUTO-TRAIN] failed (rc=$?), retry later today" >> "$AUTO_TRAIN_LOG"
+            fi
+        ) &
+        return
+    fi
+}
 
 while true; do
     # Clear prediction flag once the VALIDATION window closes (this is longer
@@ -203,6 +264,12 @@ while true; do
     NN_WD=$((NN_WD + 1))
     if [ $((NN_WD % 10)) -eq 0 ] 2>/dev/null; then
         sh "$MODDIR/bin/ensure_collector.sh" watchdog
+    fi
+
+    # NN v3.1.1: 自动训练检查 (每 300 轮 x 3s = 15 分钟; 仅窗口内可能触发)
+    AUTO_CHK=$((AUTO_CHK + 1))
+    if [ $((AUTO_CHK % 300)) -eq 0 ] 2>/dev/null; then
+        nn_auto_train_check
     fi
 
     sleep 3

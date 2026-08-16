@@ -1,7 +1,7 @@
 id=sd730-scheduler
 name=SD730 Smart Scheduler
-version=v3.1.1 (NN)
-versionCode=311
+version=v3.2 (NN)
+versionCode=320
 author=mohuanmo
-description=SD730 Smart Scheduler + Neural Scheduler v3.1.1. Patching/inference/binding are Python-free (awk/shell). MODEL TRAINING requires Python3 (py2droid or Termux; numpy optional - pure-python fallback included). k/cap scene model (210 params) + thread-level dual-module model (657 params) with frame-time feedback. v3.1.1: fixed thermal sensor misread (lmh-dcvs 75000), --force now bypasses standby/data gates with 85C hard ceiling, real-time training logs (-u).
+description=SD730 Smart Scheduler + Neural Network Scheduler v3.2. Thread-level neural model (657 params, encoder+scorer) with frame-time feedback, enabled+auto-train by default. V2 scene-level model removed. Pure-python training engine included (no numpy needed). v3.2: unified "Neural Network Model" naming, V2 k/cap removed, defaults all-on.
 updateJson=

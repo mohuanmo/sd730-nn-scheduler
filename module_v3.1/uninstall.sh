@@ -103,6 +103,8 @@ rm -f /data/local/tmp/sd730-legacy.state 2>/dev/null
 pkill -f "collector.sh" 2>/dev/null
 rm -rf /data/adb/modules/sd730-scheduler/data/collector 2>/dev/null
 rm -f /data/local/tmp/sd730-collector.log 2>/dev/null
+rm -f /data/local/tmp/sd730-nn-auto-train.log 2>/dev/null
+rm -f /data/local/tmp/sd730-nn-auto-train.log.tmp 2>/dev/null
 
 # Remove the Scene entry point, but only if it belongs to THIS module
 # (another scheduler may have legitimately overwritten /data/powercfg.sh).

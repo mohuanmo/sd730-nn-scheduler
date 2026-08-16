@@ -37,8 +37,14 @@ STUCK_AFTER=120
 [ -d "$LOG_DIR" ] || mkdir -p "$LOG_DIR" 2>/dev/null
 
 # 写日志; 目录/文件不可写时静默降级 (绝不因日志失败而中断启动)
+# v3.1.1: 加滚动限制, 超 256KB 保留末 200 行, 防止无限增长
 wlog() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG" 2>/dev/null || true
+    local size=$(wc -c < "$LOG" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    if [ "$size" -gt 262144 ] 2>/dev/null; then
+        tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+    fi
 }
 
 # 判断 pid 是否为"活着的、且属于本模块"的 collector

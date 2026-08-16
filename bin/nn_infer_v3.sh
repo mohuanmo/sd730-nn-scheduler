@@ -38,14 +38,30 @@ GPU=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null | tr -d '% \r
 case "$GPU" in ''|*[!0-9]*) GPU=0 ;; esac
 [ "$GPU" -gt 100 ] && GPU=100
 
+# v3.1.1: 只统计真正的温度传感器, 过滤 lmh-dcvs/ibat/vbat/bcl/soc/step/lowf;
+# 旧实现全 zone 取最大/1000 会把 lmh-dcvs 的 75000 误采成 75°C, 污染推理特征。
 MAX_TEMP=0
 for zone in /sys/class/thermal/thermal_zone*/temp; do
     [ -f "$zone" ] || continue
+    TYPE=$(cat "${zone%/temp}/type" 2>/dev/null)
+    case "$TYPE" in
+        *-tz|*-usr|*therm*|battery|bms) ;;
+        *) continue ;;
+    esac
     T=$(cat "$zone" 2>/dev/null)
     case "$T" in ''|*[!0-9]*) continue ;; esac
-    [ "$T" -gt "$MAX_TEMP" ] && MAX_TEMP=$T
+    [ "$T" -le 0 ] && continue
+    C=0
+    if [ "$T" -ge 10000 ] && [ "$T" -le 150000 ]; then
+        C=$((T / 1000))
+    elif [ "$T" -ge 100 ] && [ "$T" -le 1500 ]; then
+        C=$(( (T + 5) / 10 ))
+    elif [ "$T" -ge 10 ] && [ "$T" -le 150 ]; then
+        C=$T
+    fi
+    [ "$C" -ge 10 ] && [ "$C" -le 90 ] && [ "$C" -gt "$MAX_TEMP" ] && MAX_TEMP=$C
 done
-TEMP=$((MAX_TEMP / 1000))
+TEMP=$MAX_TEMP
 
 BATT=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo "50")
 case "$BATT" in ''|*[!0-9]*) BATT=50 ;; esac

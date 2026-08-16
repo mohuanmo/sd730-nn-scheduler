@@ -32,8 +32,15 @@ case "$KEEP_DAYS" in ''|*[!0-9]*) KEEP_DAYS=5 ;; esac
 [ "$KEEP_DAYS" -gt 30 ] && KEEP_DAYS=30
 
 # 独立轻量日志 (collector.sh 不 source functions.sh, 自带 log_msg)
+# v3.1.1: 加滚动限制, 超 256KB 保留末 200 行, 防止无限增长
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> /data/local/tmp/sd730-collector.log 2>/dev/null || true
+    local size=$(wc -c < /data/local/tmp/sd730-collector.log 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    if [ "$size" -gt 262144 ] 2>/dev/null; then
+        tail -n 200 /data/local/tmp/sd730-collector.log > /data/local/tmp/sd730-collector.log.tmp 2>/dev/null && \
+            mv /data/local/tmp/sd730-collector.log.tmp /data/local/tmp/sd730-collector.log 2>/dev/null
+    fi
 }
 
 # v3.1 fix: dumpsys 偶发阻塞 (system_server 忙/ binder 拥塞) 会卡死整个采集循环
@@ -161,14 +168,43 @@ get_gpu() {
 }
 
 get_temp() {
-    local max_t=0 t zone
+    # v3.1.1: 修复假高温污染。旧实现取所有 thermal_zone*/temp 原始值最大/1000,
+    # 会把 lmh-dcvs-* (限频管理, 恒报 75000) 误采成 75°C 写进样本特征,
+    # 导致训练标签被高温惩罚污染 (k 全被压到最低)。
+    # 现在只统计真正的温度传感器 (-tz/-usr/含therm/battery/bms),
+    # 单位归一化 (毫摄氏度/十分之一度/摄氏度) + [10,90]°C 范围过滤。
+    local max_t=0 t zone type c
     for zone in /sys/class/thermal/thermal_zone*/temp; do
         [ -f "$zone" ] || continue
+        type=$(cat "${zone%/temp}/type" 2>/dev/null)
+        case "$type" in
+            *-tz|*-usr|*therm*|battery|bms) ;;
+            *) continue ;;
+        esac
         t=$(cat "$zone" 2>/dev/null)
         case "$t" in ''|*[!0-9]*) continue ;; esac
-        [ "$t" -gt "$max_t" ] && max_t=$t
+        [ "$t" -le 0 ] && continue
+        c=0
+        if [ "$t" -ge 10000 ] && [ "$t" -le 150000 ]; then
+            c=$((t / 1000))                     # 毫摄氏度: 48000 -> 48°C
+        elif [ "$t" -ge 100 ] && [ "$t" -le 1500 ]; then
+            c=$(( (t + 5) / 10 ))               # 十分之一度: 480 -> 48°C
+        elif [ "$t" -ge 10 ] && [ "$t" -le 150 ]; then
+            c=$t                                # 摄氏度
+        fi
+        [ "$c" -ge 10 ] && [ "$c" -le 90 ] && [ "$c" -gt "$max_t" ] && max_t=$c
     done
-    echo $((max_t / 1000))
+    if [ "$max_t" -le 0 ]; then
+        # 回退: 电池温度
+        t=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+        case "$t" in ''|*[!0-9]*) ;;
+            *)
+                [ "$t" -ge 100 ] && [ "$t" -le 1500 ] && max_t=$(( (t + 5) / 10 ))
+                [ "$t" -ge 10000 ] && [ "$t" -le 150000 ] && max_t=$((t / 1000))
+            ;;
+        esac
+    fi
+    echo "$max_t"
 }
 
 get_batt() {

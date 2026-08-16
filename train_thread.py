@@ -282,6 +282,12 @@ def main():
     n_valid = int(M.sum())
     print(f"    Valid thread labels (frame feedback ok): {n_valid}/{M.size} "
           f"({n_valid/M.size*100:.0f}%)")
+    # v3.2 fix: 0 条有效帧率反馈 -> 模型无标签可学, 禁止导出
+    if n_valid == 0:
+        print("  [FATAL] 0 条有效帧率反馈样本, 模型无可学习标签, 不导出模型!")
+        print("          这是采集端问题: .frame_stats 未成功写入 / traw 第 13-16 列全为 0|0|0|1")
+        print("          排查: tail -20 /data/local/tmp/sd730-collector.log; cat $MODDIR/data/collector/.frame_stats")
+        sys.exit(2)
 
     # 划分 (按场景)
     n_tr = int(len(Xs)*0.85)
@@ -295,6 +301,9 @@ def main():
         kc, s, h_sc = enc.fwd(Xs[:n_tr])
         Xt_tr = Xt[:n_tr].reshape(-1, 46); Yt_tr = Yt[:n_tr].reshape(-1, 1)
         Mt_tr = M[:n_tr].reshape(-1, 1)
+        if Mt_tr.sum() == 0:
+            print("  [FATAL] 训练集 0 条有效帧率反馈样本 (有效样本全在验证集), 不导出模型!")
+            sys.exit(2)
         st_tr = np.repeat(s, 6, axis=0)
         pt, h = scr.fwd(st_tr, Xt_tr[:, 25:46])
         # 仅有效帧率样本参与损失
@@ -318,8 +327,11 @@ def main():
             Xt_v = Xt[n_tr:].reshape(-1, 46); Yt_v = Yt[n_tr:].reshape(-1, 1)
             Mt_v = M[n_tr:].reshape(-1, 1)
             pv, _ = scr.fwd(sv_r, Xt_v[:, 25:46])
-            loss = bce(pv[Mt_v.flatten()==1], Yt_v[Mt_v.flatten()==1]) if Mt_v.sum() > 0 else 0
-            print(f"  Epoch {e:3d}: thread-val-loss={loss:.4f}")
+            if Mt_v.sum() > 0:
+                loss = bce(pv[Mt_v.flatten()==1], Yt_v[Mt_v.flatten()==1])
+                print(f"  Epoch {e:3d}: thread-val-loss={loss:.4f}")
+            else:
+                print(f"  Epoch {e:3d}: thread-val-loss=  (no valid val samples)")
 
     print("\n[4] Exporting awk models...")
     export_awk(enc, scr)

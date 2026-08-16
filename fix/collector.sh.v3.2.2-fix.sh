@@ -19,6 +19,19 @@ FG_DUR_FILE="$DATA_DIR/.fg_duration"
 FG_START_FILE="$DATA_DIR/.fg_start"
 THREADS_SNAP="$DATA_DIR/.threads_snapshot"   # v3.0: 线程快照 (name|cpu|21维特征)
 FRAME_STATS="$DATA_DIR/.frame_stats"         # v3.0: 帧率反馈 (帧数|平均帧时间|方差|0帧比例)
+FRAME_STATS_OWNER="$DATA_DIR/.frame_stats_owner"  # v3.2 fix: 该帧统计属于哪个前台 app (防跨 app 复用脏数据)
+FRAME_LOG_STAMP="$DATA_DIR/.frame_log_stamp"      # v3.2.2: 帧率失败日志节流时间戳
+
+# v3.2.2: 帧率失败日志节流 (30s 一条). 旧版每 5s 轮询失败打一条, 一天几千条刷屏
+frame_log() {
+    local now=$(date +%s) last=0
+    [ -f "$FRAME_LOG_STAMP" ] && last=$(cat "$FRAME_LOG_STAMP" 2>/dev/null)
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    if [ $((now - last)) -ge 30 ] 2>/dev/null; then
+        echo "$now" > "${FRAME_LOG_STAMP}.tmp.$$" 2>/dev/null && mv "${FRAME_LOG_STAMP}.tmp.$$" "$FRAME_LOG_STAMP" 2>/dev/null
+        log_msg "$1"
+    fi
+}
 V3_LAST=0                                     # v3.0: 上次线程/帧率采样时间
 
 # 采集数据保留天数 (v2.1.6): 统一从 nn.conf 读取 nn_data_keep_days, 默认 5 天
@@ -386,36 +399,70 @@ $tname|$tid|$j"
 }
 
 # ============ v3.0: 帧率反馈采集 (帧时间方差) ============
+# v3.2 fix: 帧率反馈采集失败 -> .traw 里 fn=0/fzero=1 默认值 -> 训练端 0% 有效标签
+#   (表现为 loss 恒 0.0000, 模型是随机初始化导出, 等于没训)
+# v3.2.2 fix: 3 个后续问题
+#   1) 失败日志每 5s 刷一条 -> frame_log() 30s 节流
+#   2) 视频场景 (bilibilihd 播放中) 也报 "帧数不足" -> 旧逻辑取"第一个 ≥10 帧"的候选 layer,
+#      会选到 UI/弹幕层(帧少)而非视频渲染层 -> 改为遍历所有候选, 选"有效帧数最多"的 layer
+#   3) 微信等报 "no layer matching" -> dumpsys SurfaceFlinger --list 在 SF 忙时 5s 被掐断,
+#      只输出前半段(系统层), 后半段 app 层没打出来 -> --list 超时放宽到 10s
 # 输出: 有效帧数|平均帧时间ms|方差ms²|0帧比例  (写入 .frame_stats)
 # 规则: 有效帧<10 或 0帧比例>30% 时训练端跳过帧率反馈
 get_frame_stats() {
     local pkg="$1"
-    local layer
-    layer=$(dumpsys_t SurfaceFlinger --list | grep -i "${pkg%.*}" | head -1)
-    [ -z "$layer" ] && return 1
-    local raw
-    raw=$(dumpsys_t SurfaceFlinger --latency "$layer" | tail -n +4 | head -128)
-    [ -z "$raw" ] && return 1
-    echo "$raw" | awk '
-    BEGIN { n=0; prev=0; sum=0; sum2=0; zeros=0; total=0 }
-    {
-        total++
-        actual=$2 + 0
-        if (actual <= 0) { zeros++; next }
-        if (prev > 0) {
-            dt = actual - prev
-            if (dt > 0 && dt < 1000000000) {   # 排除异常间隔 (>1s)
-                n++; sum += dt; sum2 += dt*dt
-            }
-        }
-        prev = actual
-    }
-    END {
-        if (total == 0) { print "0|0|0|1"; exit }
-        if (n < 10) { printf "%d|0|0|%.2f\n", n, zeros/total; exit }
-        avg = sum/n; var = sum2/n - avg*avg
-        printf "%d|%.2f|%.2f|%.2f\n", n, avg/1000000, var/1e12, zeros/total
-    }' > "${FRAME_STATS}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS}.tmp.$$" "$FRAME_STATS"
+    [ -z "$pkg" ] && return 1
+    # 前台 app 切换 -> 旧帧统计作废
+    local owner=""
+    [ -f "$FRAME_STATS_OWNER" ] && owner=$(cat "$FRAME_STATS_OWNER" 2>/dev/null)
+    if [ "$owner" != "$pkg" ]; then
+        rm -f "$FRAME_STATS" 2>/dev/null
+        echo "$pkg" > "${FRAME_STATS_OWNER}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS_OWNER}.tmp.$$" "$FRAME_STATS_OWNER" 2>/dev/null
+    fi
+    local list layer raw candidates
+    # v3.2.2: --list 超时 5s -> 10s (SF 忙时输出几千行会被 5s 掐断, 造成假阴性 "no layer matching")
+    if command -v timeout >/dev/null 2>&1; then
+        list=$(timeout 10 dumpsys SurfaceFlinger --list 2>/dev/null)
+    else
+        list=$(dumpsys SurfaceFlinger --list 2>/dev/null)
+    fi
+    [ -z "$list" ] && { frame_log "[frame] SurfaceFlinger --list empty/timeout for $pkg"; return 1; }
+    # 候选1: 完整包名固定串匹配, 优先带 # 的 layer (真实渲染 surface)
+    candidates=$(echo "$list" | grep -iF "$pkg" | grep -F '#')
+    # 候选2: 完整包名匹配任意 layer
+    [ -z "$candidates" ] && candidates=$(echo "$list" | grep -iF "$pkg" | head -8)
+    # 候选3: 包名去掉最后一段 (兼容 layer 名省略 activity 后缀)
+    [ -z "$candidates" ] && candidates=$(echo "$list" | grep -iF "${pkg%.*}" | head -8)
+    [ -z "$candidates" ] && { frame_log "[frame] no layer matching $pkg"; return 1; }
+    # v3.2.2: 遍历所有候选, 选"有效帧数最多"的 layer
+    local n best_n=0 best_raw="" best_layer=""
+    for layer in $candidates; do
+        [ -n "$layer" ] || continue
+        # 只取 3 列纯数字行 (层名/刷新周期/表头自动跳过), 最多 128 行
+        raw=$(dumpsys_t SurfaceFlinger --latency "$layer" 2>/dev/null | \
+              awk 'NF==3 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {print; if (++c>=128) exit}')
+        [ -z "$raw" ] && continue
+        n=$(echo "$raw" | awk '{a=$2+0; if(a>0) c++} END {print c+0}')
+        if [ "${n:-0}" -gt "$best_n" ] 2>/dev/null; then
+            best_n=$n; best_raw=$raw; best_layer=$layer
+        fi
+    done
+    if [ "${best_n:-0}" -ge 10 ] 2>/dev/null && [ -n "$best_raw" ]; then
+        echo "$best_raw" | awk '
+            BEGIN { n=0; prev=0; sum=0; sum2=0; zeros=0; total=0 }
+            { total++; actual=$2+0
+              if (actual <= 0) { zeros++; next }
+              if (prev > 0) { dt=actual-prev; if (dt>0 && dt<1000000000) { n++; sum+=dt; sum2+=dt*dt } }
+              prev=actual }
+            END { if (total==0) { print "0|0|0|1"; exit }
+                  if (n<10) { printf "%d|0|0|%.2f\n", n, zeros/total; exit }
+                  avg=sum/n; var=sum2/n-avg*avg; if (var<0) var=0
+                  printf "%d|%.2f|%.2f|%.2f\n", n, avg/1000000, var/1e12, zeros/total }' \
+            > "${FRAME_STATS}.tmp.$$" 2>/dev/null && mv "${FRAME_STATS}.tmp.$$" "$FRAME_STATS"
+        return 0
+    fi
+    frame_log "[frame] no layer with >=10 valid frames for $pkg (best=$best_n)"
+    return 1
 }
 
 while true; do
@@ -450,13 +497,20 @@ while true; do
         # 追加历史记录到 YYYYMMDD.traw (供 train_thread.py 训练)
         # 格式: ts|pkg|聚合10|fn|favg|fvar|fzero|t1name|t1cpu|...|t6name|t6cpu
         traw="$DATA_DIR/$(date +%Y%m%d).traw"
+        # v3.2 fix: 只有帧统计属于当前 app 且 <30s 新鲜才采用, 否则用默认值
+        # (旧实现: 换 app 后仍复用上个 app 的 .frame_stats -> 用错的帧反馈标错标签)
         fn=0 favg=0 fvar=0 fzero=1
         if [ -f "$FRAME_STATS" ]; then
-            IFS='|' read -r fn favg fvar fzero < "$FRAME_STATS" 2>/dev/null
-            case "$fn" in ''|*[!0-9]*) fn=0 ;; esac
-            case "$favg" in ''|*[!0-9.]*) favg=0 ;; esac
-            case "$fvar" in ''|*[!0-9.]*) fvar=0 ;; esac
-            case "$fzero" in ''|*[!0-9.]*) fzero=1 ;; esac
+            fs_age=$(( $(date +%s) - $(stat -c %Y "$FRAME_STATS" 2>/dev/null || echo 0) ))
+            fs_owner=""
+            [ -f "$FRAME_STATS_OWNER" ] && fs_owner=$(cat "$FRAME_STATS_OWNER" 2>/dev/null)
+            if [ "$fs_owner" = "$pkg" ] && [ "$fs_age" -le 30 ] 2>/dev/null; then
+                IFS='|' read -r fn favg fvar fzero < "$FRAME_STATS" 2>/dev/null
+                case "$fn" in ''|*[!0-9]*) fn=0 ;; esac
+                case "$favg" in ''|*[!0-9.]*) favg=0 ;; esac
+                case "$fvar" in ''|*[!0-9.]*) fvar=0 ;; esac
+                case "$fzero" in ''|*[!0-9.]*) fzero=1 ;; esac
+            fi
         fi
         # 从快照取最多 6 线程
         tline="$traw_line"

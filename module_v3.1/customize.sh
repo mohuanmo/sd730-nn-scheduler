@@ -334,6 +334,7 @@ set_perm "$MODPATH/patch_nn.sh" 0 0 0755
 set_perm "$MODPATH/train.py" 0 0 0755
 set_perm "$MODPATH/train_pure.py" 0 0 0755
 set_perm "$MODPATH/train_thread.py" 0 0 0755
+set_perm "$MODPATH/train_thread_pure.py" 0 0 0755
 
 # 数据/模型目录
 mkdir -p "$MODPATH/data/collector"
@@ -368,20 +369,25 @@ fi
 chmod 0644 "$MODPATH/config/nn.conf" 2>/dev/null
 if [ ! -f "$MODPATH/config/v3.conf" ]; then
     cat > "$MODPATH/config/v3.conf" <<'EOF'
-# SD730 Neural Scheduler v3.0 - Thread-level binding config
-# 默认关闭: 开启后热线程候选按"模型分数"重排 (模型缺失时自动回退 v2 规则)
-v3_enabled=false
+# SD730 Neural Scheduler v3.2 - Neural Network (thread-level) config
+# 神经网络(线程级)模型: 开启后热线程候选按"模型分数"重排 (模型缺失时自动回退规则调度)
+# 默认开启 (v3.2): 装好模块即可用, 模型训练后自动生效。
+v3_enabled=true
+
+# 自动训练开关: true=训练窗口内自动训练神经网络模型 (默认开启)
+# 引擎自动选择: 有 numpy 用 train_thread.py(快), 无 numpy 用 train_thread_pure.py(纯Python)
+v3_auto_train=true
 EOF
 fi
 chmod 0644 "$MODPATH/config/v3.conf" 2>/dev/null
-ui_print "[+] Neural Scheduler v3.1 installed."
-ui_print "[+] 默认: nn_alpha=0(纯规则) + v3_enabled=false (安全中性)"
+ui_print "[+] Neural Scheduler v3.2 installed."
+ui_print "[+] 默认: 神经网络模型已启用 (v3_enabled=true) + 自动训练开启 (v3_auto_train=true)"
+ui_print "[+] V2 场景级模型已移除 (v3.2), 只保留神经网络(线程级)模型"
 ui_print ""
 ui_print "[!] 说明: 打补丁/推理/调度 无需 Python (awk/shell 实现)"
 ui_print "[!] 但 模型训练 需要 Python3:"
 ui_print "[!]   - py2droid (推荐): 系统级 python3"
 ui_print "[!]   - 或 Termux: pkg install python"
 ui_print "[!]   训练命令:"
-ui_print "[!]     v2: sd730-scheduler --nn-train   (numpy版) / --nn-train-now (强制)"
-ui_print "[!]         train_pure.py = 纯Python版, 无 numpy 也能训练"
-ui_print "[!]     v3: python3 train_thread.py --force  (需 numpy)"
+ui_print "[!]     sd730-scheduler --nn-train      (自动) / --nn-train-now (强制)"
+ui_print "[!]     引擎: 有 numpy -> train_thread.py / 无 numpy -> train_thread_pure.py"
