@@ -1,0 +1,14 @@
+{
+    "name": "SD730 Smart Scheduler",
+    "author": "mohuanmo",
+    "version": "v1.3.0",
+    "versionCode": 130,
+    "features": {
+        "strict": false,
+        "pedestal": false
+    },
+    "module": "sd730-scheduler",
+    "state": "/sdcard/Android/sd730-scheduler/cur_powermode.txt",
+    "entry": "/data/powercfg.sh",
+    "projectUrl": "https://github.com/mohuanmo/sd730-scheduler"
+}
